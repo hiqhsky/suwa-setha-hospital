@@ -56,7 +56,7 @@ function calcRisk({ enrolled, anomalous, failed }) {
 function tierOf(s) {
   if (s <= 30) return { k: "low", label: "Trusted \u2014 Access Granted", c: T.ok, Icon: ShieldCheck };
   if (s <= 60) return { k: "med", label: "Caution \u2014 Step-up Required", c: T.warn, Icon: ShieldAlert };
-  return { k: "high", label: "High Risk \u2014 Access Denied", c: T.bad, Icon: ShieldX };
+  return { k: "high", label: "High Risk - Access Denied", c: T.bad, Icon: ShieldX };
 }
 
 /* ============ audio ============ */
@@ -304,7 +304,7 @@ function HeroSection({ onEnroll, onLogin }) {
           style={{ fontSize: 18, color: T.muted, maxWidth: 560, margin: "0 auto 48px", lineHeight: 1.75 }}
         >
           The Suwa Setha biometric cybersecurity platform. Live facial liveness,
-          transparent multi-factor risk intelligence, immutable audit \u2014 built for clinical trust.
+          transparent multi-factor risk intelligence, immutable audit - built for clinical trust.
         </motion.p>
 
         <motion.div
@@ -706,7 +706,7 @@ export default function App() {
           </motion.section>
 
           <footer style={{ textAlign: "center", padding: "48px 56px 64px", borderTop: "1px solid " + T.line2, fontSize: 12, color: T.dim, letterSpacing: "0.06em", lineHeight: 1.8 }}>
-            Securing Healthcare Operations \u2014 AI-Driven Biometric Cybersecurity Platform for Suwa Setha Hospital
+            Securing Healthcare Operations - AI-Driven Biometric Cybersecurity Platform for Suwa Setha Hospital
             <br />Prototype {BULLET} identity matching simulated {BULLET} liveness detection real {BULLET} fictional clinical data only
           </footer>
         </div>
@@ -988,7 +988,7 @@ export default function App() {
                   {tier.k === "high" && (
                     <div style={{ border: "1px solid rgba(248,113,113,0.35)", background: "rgba(248,113,113,0.06)", borderRadius: 16, padding: 20, marginBottom: 14, textAlign: "center" }}>
                       <AlertTriangle color={T.bad} size={28} style={{ marginBottom: 10 }} />
-                      <div style={{ fontWeight: 700, color: T.bad }}>Access Denied \u2014 Incident Logged</div>
+                      <div style={{ fontWeight: 700, color: T.bad }}>Access Denied - Incident Logged</div>
                       <button style={Object.assign({}, btnGhost, { marginTop: 14, color: T.bad, borderColor: "rgba(248,113,113,0.4)" })}
                         onClick={() => { try { sfx.tap(); } catch (e) {} setToast("Incident filed with Security Admin"); }}>
                         Report to Security Admin
@@ -1294,7 +1294,7 @@ export default function App() {
                 <h1 style={{ fontSize: 32, fontWeight: 500, letterSpacing: "-0.03em" }}>Iteration and feedback log</h1>
               </motion.div>
               <motion.p variants={fadeUp} style={{ color: T.muted, marginBottom: 40, lineHeight: 1.7 }}>
-                Development history inside the product \u2014 each release driven by named end-user feedback.
+                Development history inside the product - each release driven by named end-user feedback.
               </motion.p>
               {vers.map((x, i) => (
                 <motion.div key={i} variants={fadeUp} style={Object.assign({}, glass, { padding: 32, marginBottom: 18 })}>
