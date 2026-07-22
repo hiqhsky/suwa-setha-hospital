@@ -1,83 +1,12 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=IBM+Plex+Mono:wght@400;600;700&display=swap');
-
-:root {
-  color-scheme: dark;
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-}
-
-* {
-  box-sizing: border-box;
-  margin: 0;
-  padding: 0;
-}
-
-html, body {
-  margin: 0;
-  padding: 0;
-  width: 100%;
-  min-height: 100%;
-  background: #030303;
-  color: #f7f3ea;
-  font-family: 'Inter', system-ui, sans-serif;
-  overflow-x: hidden;
-}
-
-#root {
-  width: 100%;
-  min-height: 100vh;
-  margin: 0;
-  text-align: left;
-  border: none;
-  background: #030303;
-}
-
-/* Remove default button styles */
-button {
-  font-family: 'Inter', system-ui, sans-serif;
-}
-
-/* Remove default input/select styles */
-input, select, textarea {
-  font-family: 'Inter', system-ui, sans-serif;
-  color: #f7f3ea;
-}
-
-/* Scrollbar styling */
-::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
-}
-
-::-webkit-scrollbar-track {
-  background: #080808;
-}
-
-::-webkit-scrollbar-thumb {
-  background: rgba(212, 175, 55, 0.25);
-  border-radius: 99px;
-}
-
-::-webkit-scrollbar-thumb:hover {
-  background: rgba(212, 175, 55, 0.45);
-}
-
-/* Shimmer animation used in dashboard */
-@keyframes shimmer {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.4; }
-}
-
-/* Prevent blue highlight on click */
-* {
-  -webkit-tap-highlight-color: transparent;
-  outline: none;
-}
-
-/* Selection color */
-::selection {
-  background: rgba(212, 175, 55, 0.25);
-  color: #f7f3ea;
-}
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Suwa Setha Hospital</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
