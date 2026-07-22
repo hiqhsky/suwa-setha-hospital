@@ -1,344 +1,634 @@
-import React, { useState, useRef, useCallback, useEffect } from "react";
+import React, { useState, useRef, useEffect, useCallback } from "react";
 import * as faceapi from "@vladmandic/face-api";
-import { ShieldCheck, ShieldAlert, ShieldX, LogOut, Stethoscope, Users, ClipboardList, Lock, Camera } from "lucide-react";
-import Chart from "chart.js/auto";
+import { motion, AnimatePresence } from "framer-motion";
+import {
+  Shield, ShieldCheck, ShieldAlert, ShieldX, Camera, CameraOff,
+  UserPlus, LogIn, Activity, Clock, MapPin, Smartphone,
+  Fingerprint, FileText, Scale, X, ChevronRight, CheckCircle2,
+  AlertTriangle, Lock, Eye, RefreshCw
+} from "lucide-react";
 
-const FONT_IMPORT = `@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap');`;
-
-const FACE_MODEL_URL = "https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.13/model/";
-
-const ROLES = [
-  { id: "admin", label: "Administrator", Icon: Lock },
-  { id: "doctor", label: "Doctor", Icon: Stethoscope },
-  { id: "nurse", label: "Nurse", Icon: Users },
-  { id: "receptionist", label: "Receptionist", Icon: ClipboardList },
-];
+const MODEL_URL = "https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.13/model/";
 
 const FACTORS = [
-  { key: "device", label: "Device Fingerprint", weight: 22 },
-  { key: "location", label: "Network Location", weight: 18 },
-  { key: "time", label: "Time-of-Day Pattern", weight: 8 },
-  { key: "biometric", label: "Facial Liveness & Match", weight: 30 },
-  { key: "behavioral", label: "Behavioral Baseline", weight: 12 },
-  { key: "frequency", label: "Access Frequency", weight: 10 },
+  { key: "device", label: "Device Recognition", weight: 22, icon: Smartphone },
+  { key: "location", label: "Network / Location", weight: 18, icon: MapPin },
+  { key: "time", label: "Time-of-Day Pattern", weight: 12, icon: Clock },
+  { key: "biometric", label: "Facial Liveness & Match", weight: 30, icon: Fingerprint },
+  { key: "behavior", label: "Behavioral Baseline", weight: 10, icon: Activity },
+  { key: "attempts", label: "Recent Failed Attempts", weight: 8, icon: AlertTriangle },
 ];
 
-function computeScan(anomalous, attempts) {
-  if (anomalous) {
-    return {
-      device: { pass: false, detail: "Unrecognized device" },
-      location: { pass: false, detail: "External network" },
-      time: { pass: true, detail: "03:14 — outside normal hours", warn: true },
-      biometric: { pass: true, detail: `${92 - attempts * 4}% match`, value: 92 - attempts * 4 },
-      behavioral: { pass: false, detail: "Rhythm deviation detected" },
-      frequency: { pass: true, detail: "3 attempts in 4 minutes", warn: true },
-      failedAttempts: attempts,
-    };
-  }
-  return {
-    device: { pass: true, detail: "Registered hospital workstation" },
-    location: { pass: true, detail: "Internal hospital network" },
-    time: { pass: true, detail: "Within normal operating hours" },
-    biometric: { pass: true, detail: "97.8% match • Live face confirmed", value: 97.8 },
-    behavioral: { pass: true, detail: "Consistent with baseline" },
-    frequency: { pass: true, detail: "Normal frequency" },
-    failedAttempts: 0,
+function generateRisk(enrolled, anomalous = false) {
+  const base = {
+    device: { pass: true, detail: "Recognised hospital workstation", score: 0 },
+    location: { pass: true, detail: "Internal hospital network (Ward 3)", score: 0 },
+    time: { pass: true, detail: "Within normal shift hours", score: 0 },
+    biometric: { pass: true, detail: "Live face confirmed • 97.4% template match", score: 0 },
+    behavior: { pass: true, detail: "Consistent with enrolled baseline", score: 0 },
+    attempts: { pass: true, detail: "0 failed attempts in last 15 min", score: 0 },
   };
+
+  if (!enrolled) {
+    base.biometric = { pass: false, detail: "No enrolled biometric template found", score: 38 };
+    base.device = { pass: false, detail: "Unregistered device", score: 18 };
+  }
+
+  if (anomalous) {
+    base.device = { pass: false, detail: "Unrecognised device fingerprint", score: 22 };
+    base.location = { pass: false, detail: "Login from external/public network", score: 18 };
+    base.time = { pass: true, detail: "03:17 — outside normal hours", score: 9, warn: true };
+    base.behavior = { pass: false, detail: "Typing/cursor rhythm deviation", score: 10 };
+    base.attempts = { pass: true, detail: "3 failed attempts in 6 minutes", score: 8, warn: true };
+    base.biometric.score = 12;
+  }
+
+  const total = Object.values(base).reduce((sum, f) => sum + (f.score || 0), 0);
+  return { factors: base, score: Math.min(100, total) };
 }
 
-function scoreFromScan(scan) {
-  let risk = 0;
-  if (!scan.device.pass) risk += 22;
-  if (!scan.location.pass) risk += 18;
-  if (scan.time.warn) risk += 8;
-  if (scan.biometric.value < 95) risk += (95 - scan.biometric.value) * 0.65;
-  if (!scan.behavioral.pass) risk += 12;
-  if (scan.frequency.warn) risk += 6;
-  risk += scan.failedAttempts * 7;
-  return Math.min(100, Math.round(risk));
+function getTier(score) {
+  if (score <= 22) return { level: "low", label: "Trusted — Access Granted", color: "#10b981", Icon: ShieldCheck };
+  if (score <= 55) return { level: "medium", label: "Caution — Step-up Verification Required", color: "#f59e0b", Icon: ShieldAlert };
+  return { level: "high", label: "High Risk — Access Denied", color: "#ef4444", Icon: ShieldX };
 }
-
-function verdictFromScore(score) {
-  if (score <= 25) return { tier: "low", label: "Access Granted", color: "#00c4b4", Icon: ShieldCheck };
-  if (score <= 60) return { tier: "medium", label: "Step-up Verification Required", color: "#d4af37", Icon: ShieldAlert };
-  return { tier: "high", label: "Access Denied — Security Review Triggered", color: "#e63939", Icon: ShieldX };
-}
-
-const PIPELINE_STAGES = [
-  { name: "Registration", count: 29, wait: "5 min", icon: "📋" },
-  { name: "Triage", count: 44, wait: "17 min", icon: "🩺" },
-  { name: "Consultation", count: 61, wait: "23 min", icon: "👨‍⚕️" },
-  { name: "Diagnostics", count: 21, wait: "12 min", icon: "🔬" },
-  { name: "Discharge", count: 17, wait: "4 min", icon: "🏠" },
-];
-
-const ALERTS = [
-  { title: "Triage Bottleneck Forming", desc: "Average wait 4min above SLA. Model predicts continued pressure.", time: "2m ago" },
-  { title: "Emergency Surge Forecast", desc: "+31% arrivals predicted 17:00–19:00 based on historical + weather data.", time: "27m ago" },
-];
-
-const DEPTS = [
-  { name: "Emergency", load: 89, patients: 24 },
-  { name: "OPD", load: 67, patients: 39 },
-  { name: "Radiology", load: 54, patients: 12 },
-  { name: "Laboratory", load: 41, patients: 8 },
-  { name: "Pharmacy", load: 76, patients: 19 },
-];
 
 export default function App() {
-  const [view, setView] = useState("login");
-  const [role, setRole] = useState("doctor");
-  const [anomalous, setAnomalous] = useState(false);
-  const [phase, setPhase] = useState("idle");
-  const [scan, setScan] = useState(null);
-  const [score, setScore] = useState(0);
-  const [revealCount, setRevealCount] = useState(0);
-  const [highRiskStreak, setHighRiskStreak] = useState(0);
+  const [view, setView] = useState("home"); // home | enroll | login | audit | ethics
+  const [enrolledUsers, setEnrolledUsers] = useState(() => {
+    try { return JSON.parse(localStorage.getItem("suwa_enrolled") || "[]"); } catch { return []; }
+  });
+  const [auditLog, setAuditLog] = useState(() => {
+    try { return JSON.parse(localStorage.getItem("suwa_audit") || "[]"); } catch { return []; }
+  });
 
-  const [patients, setPatients] = useState(164);
-  const [waitTime, setWaitTime] = useState(27);
-  const [capacity, setCapacity] = useState(78);
-  const [surgeRisk, setSurgeRisk] = useState("HIGH");
-  const [aiInsight, setAiInsight] = useState("Activate second triage station immediately. Projected wait reduction: 11 minutes. Confidence: 89%.");
+  // Enrolment state
+  const [enrollName, setEnrollName] = useState("");
+  const [enrollRole, setEnrollRole] = useState("Doctor");
+  const [captures, setCaptures] = useState(0);
+  const [enrollStep, setEnrollStep] = useState(0); // 0=form, 1=camera, 2=done
+
+  // Login state
+  const [phase, setPhase] = useState("idle"); // idle | scanning | result
+  const [riskData, setRiskData] = useState(null);
+  const [anomalous, setAnomalous] = useState(false);
+  const [faceDetected, setFaceDetected] = useState(false);
+  const [modelsLoaded, setModelsLoaded] = useState(false);
+  const [cameraError, setCameraError] = useState(null);
 
   const videoRef = useRef(null);
   const streamRef = useRef(null);
-  const chartRef = useRef(null);
+  const detectInterval = useRef(null);
 
+  // Load face-api models
   useEffect(() => {
-    faceapi.nets.tinyFaceDetector.loadFromUri(FACE_MODEL_URL);
+    faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL)
+      .then(() => setModelsLoaded(true))
+      .catch(() => setModelsLoaded(false));
+  }, []);
+
+  const stopCamera = useCallback(() => {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(t => t.stop());
+      streamRef.current = null;
+    }
+    if (detectInterval.current) clearInterval(detectInterval.current);
+    setFaceDetected(false);
   }, []);
 
   const startCamera = useCallback(async () => {
+    setCameraError(null);
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user" } });
-      streamRef.current = stream;
-      if (videoRef.current) videoRef.current.srcObject = stream;
-    } catch (err) {
-      alert("Camera access failed. Please use the Vercel HTTPS link on your phone or laptop.");
-    }
-  }, []);
-
-  const startScan = async () => {
-    setPhase("scanning");
-    await startCamera();
-    const scanData = computeScan(anomalous, highRiskStreak + 1);
-    setScan(scanData);
-    setRevealCount(0);
-
-    FACTORS.forEach((_, i) => setTimeout(() => setRevealCount(i + 1), 300 * (i + 1)));
-
-    const finalScore = scoreFromScan(scanData);
-    setTimeout(() => {
-      setScore(finalScore);
-      const v = verdictFromScore(finalScore);
-      if (v.tier === "high") {
-        const streak = highRiskStreak + 1;
-        setHighRiskStreak(streak);
-        if (streak >= 3) {
-          alert("Account locked due to multiple high-risk attempts (simulated for demo).");
-          setPhase("idle");
-          return;
-        }
-      }
-      setPhase("result");
-    }, 2800);
-  };
-
-  const loginSuccess = (selectedRole) => {
-    setRole(selectedRole);
-    setView("dashboard");
-    if (streamRef.current) streamRef.current.getTracks().forEach(t => t.stop());
-  };
-
-  useEffect(() => {
-    if (view !== "dashboard") return;
-    const interval = setInterval(() => {
-      setPatients(p => Math.max(130, Math.min(195, p + Math.floor(Math.random() * 11) - 5)));
-      setWaitTime(w => Math.max(15, Math.min(38, w + Math.floor(Math.random() * 7) - 3)));
-      setCapacity(c => Math.max(65, Math.min(92, c + Math.floor(Math.random() * 6) - 2)));
-      setSurgeRisk(c => c === "HIGH" ? "MODERATE" : "HIGH");
-    }, 4500);
-    return () => clearInterval(interval);
-  }, [view]);
-
-  const applyAI = () => {
-    setAiInsight("Recommendation applied. Second triage station activated. New projected average wait: 16 minutes.");
-  };
-
-  useEffect(() => {
-    if (view !== "dashboard" || !chartRef.current) return;
-    const ctx = document.getElementById("waitChart");
-    if (ctx) {
-      new Chart(ctx, {
-        type: 'line',
-        data: {
-          labels: ['08:00','09:00','10:00','11:00','12:00','13:00','14:00','15:00','16:00','17:00'],
-          datasets: [
-            { label: 'Predicted', data: [15,21,28,33,30,25,19,17,23,31], borderColor: '#00c4b4', tension: 0.4, borderWidth: 3 },
-            { label: 'Actual', data: [14,19,26,35,32,23,18,16,22,29], borderColor: '#d4af37', borderDash: [3,2], tension: 0.4, borderWidth: 3 }
-          ]
-        },
-        options: {
-          responsive: true,
-          maintainAspectRatio: false,
-          plugins: { legend: { labels: { color: '#888' } } },
-          scales: {
-            y: { grid: { color: '#222' }, ticks: { color: '#666' } },
-            x: { grid: { color: '#222' }, ticks: { color: '#666' } }
-          }
-        }
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "user", width: 640, height: 480 }
       });
+      streamRef.current = stream;
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        await videoRef.current.play();
+      }
+
+      // Live face presence detection
+      if (modelsLoaded) {
+        detectInterval.current = setInterval(async () => {
+          if (!videoRef.current) return;
+          try {
+            const detection = await faceapi.detectSingleFace(
+              videoRef.current,
+              new faceapi.TinyFaceDetectorOptions({ inputSize: 224 })
+            );
+            setFaceDetected(!!detection);
+          } catch {}
+        }, 400);
+      }
+    } catch (err) {
+      setCameraError("Camera unavailable or permission denied. Using simulated mode.");
     }
-  }, [view]);
+  }, [modelsLoaded]);
 
-  if (view === "login") {
+  // Save helpers
+  useEffect(() => {
+    localStorage.setItem("suwa_enrolled", JSON.stringify(enrolledUsers));
+  }, [enrolledUsers]);
+
+  useEffect(() => {
+    localStorage.setItem("suwa_audit", JSON.stringify(auditLog));
+  }, [auditLog]);
+
+  /* ==================== ENROLMENT ==================== */
+  const startEnrolCamera = async () => {
+    if (!enrollName.trim()) return alert("Please enter your full name");
+    setEnrollStep(1);
+    setCaptures(0);
+    await startCamera();
+  };
+
+  const captureFrame = () => {
+    if (captures >= 3) return;
+    if (modelsLoaded && !faceDetected && !cameraError) {
+      return alert("No live face detected. Centre your face in the frame.");
+    }
+    setCaptures(c => c + 1);
+  };
+
+  const finishEnrolment = () => {
+    const newUser = {
+      id: Date.now(),
+      name: enrollName.trim(),
+      role: enrollRole,
+      enrolledAt: new Date().toISOString(),
+    };
+    setEnrolledUsers(prev => [...prev, newUser]);
+    stopCamera();
+    setEnrollStep(2);
+  };
+
+  /* ==================== LOGIN / SCAN ==================== */
+  const beginScan = async () => {
+    setPhase("scanning");
+    setRiskData(null);
+    await startCamera();
+
+    // Simulate scanning delay + factor reveal
+    setTimeout(() => {
+      const isEnrolled = enrolledUsers.length > 0;
+      const result = generateRisk(isEnrolled, anomalous);
+      setRiskData(result);
+
+      const tier = getTier(result.score);
+      const logEntry = {
+        id: Date.now(),
+        user: isEnrolled ? enrolledUsers[enrolledUsers.length - 1].name : "Unknown",
+        role: isEnrolled ? enrolledUsers[enrolledUsers.length - 1].role : "—",
+        time: new Date().toLocaleString(),
+        score: result.score,
+        tier: tier.level,
+        outcome: tier.level === "high" ? "Denied" : tier.level === "medium" ? "Step-up" : "Granted",
+      };
+      setAuditLog(prev => [logEntry, ...prev].slice(0, 50));
+
+      setPhase("result");
+      stopCamera();
+    }, 3200);
+  };
+
+  /* ==================== UI COMPONENTS ==================== */
+  const Nav = () => (
+    <nav style={{
+      display: "flex", justifyContent: "space-between", alignItems: "center",
+      padding: "18px 40px", borderBottom: "1px solid rgba(255,255,255,0.06)",
+      background: "rgba(6,8,12,0.85)", backdropFilter: "blur(20px)",
+      position: "sticky", top: 0, zIndex: 50
+    }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 14, cursor: "pointer" }} onClick={() => { stopCamera(); setView("home"); }}>
+        <div style={{
+          width: 36, height: 36, borderRadius: 10,
+          background: "linear-gradient(135deg, #0d9488, #06b6d4)",
+          display: "grid", placeItems: "center"
+        }}>
+          <Shield size={18} color="white" />
+        </div>
+        <div>
+          <div style={{ fontWeight: 700, fontSize: 15, letterSpacing: "-0.3px" }}>Suwa Setha</div>
+          <div style={{ fontSize: 11, color: "#64748b", letterSpacing: 1 }}>BIOMETRIC SECURITY</div>
+        </div>
+      </div>
+
+      <div style={{ display: "flex", gap: 10 }}>
+        <button onClick={() => setView("audit")} style={ghostBtn}>Access Log</button>
+        <button onClick={() => setView("ethics")} style={ghostBtn}>Ethics & Legal</button>
+      </div>
+    </nav>
+  );
+
+  const ghostBtn = {
+    background: "transparent", border: "1px solid rgba(255,255,255,0.1)",
+    color: "#94a3b8", padding: "8px 16px", borderRadius: 8,
+    fontSize: 13, cursor: "pointer", fontWeight: 500
+  };
+
+  const primaryBtn = {
+    background: "linear-gradient(135deg, #0d9488, #0891b2)",
+    color: "white", border: "none", padding: "14px 28px",
+    borderRadius: 10, fontWeight: 600, fontSize: 14,
+    cursor: "pointer", display: "inline-flex", alignItems: "center", gap: 8
+  };
+
+  /* ==================== HOME ==================== */
+  if (view === "home") {
     return (
-      <div style={{ minHeight: "100vh", background: "#0a0a0a", color: "#e8e8e8", fontFamily: "Inter, sans-serif", display: "flex", alignItems: "center", justifyContent: "center" }}>
-        <style>{FONT_IMPORT}</style>
-        <div style={{ width: "100%", maxWidth: "520px", background: "#111", border: "1px solid #d4af37", borderRadius: "16px", padding: "40px" }}>
-          <h1 style={{ color: "#d4af37", textAlign: "center", fontFamily: "Space Grotesk, sans-serif", fontSize: "28px" }}>Suwa Setha Hospital</h1>
-          <p style={{ textAlign: "center", color: "#888", marginBottom: "30px" }}>AI-Driven Biometric Cybersecurity Platform</p>
-
-          <div style={{ textAlign: "center", margin: "30px 0" }}>
-            <div onClick={startScan} style={{ width: "180px", height: "180px", margin: "0 auto", border: "4px solid #d4af37", borderRadius: "50%", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", overflow: "hidden" }}>
-              <video ref={videoRef} muted playsInline style={{ width: "160px", height: "160px", borderRadius: "50%", objectFit: "cover", transform: "scaleX(-1)" }} />
+      <div style={{ minHeight: "100vh", background: "#06080c", color: "#e2e8f0", fontFamily: "Inter, system-ui, sans-serif" }}>
+        <Nav />
+        <div style={{ maxWidth: 1100, margin: "0 auto", padding: "80px 40px 100px" }}>
+          <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }}>
+            <div style={{ fontSize: 12, letterSpacing: 3, color: "#2dd4bf", fontWeight: 600, marginBottom: 20 }}>
+              AI-DRIVEN ACCESS CONTROL
             </div>
-            <p style={{ marginTop: "20px", color: phase === "scanning" ? "#00c4b4" : "#888", fontFamily: "IBM Plex Mono, monospace" }}>
-              {phase === "scanning" ? "LIVE BIOMETRIC SCAN ACTIVE" : "TAP TO START SECURE BIOMETRIC AUTHENTICATION"}
+            <h1 style={{
+              fontSize: "clamp(36px, 5vw, 54px)", fontWeight: 700,
+              lineHeight: 1.15, maxWidth: 720, marginBottom: 24,
+              letterSpacing: "-1px"
+            }}>
+              Securing Healthcare Operations
+            </h1>
+            <p style={{ fontSize: 18, color: "#94a3b8", maxWidth: 540, lineHeight: 1.7, marginBottom: 56 }}>
+              An AI-powered biometric cybersecurity platform that protects sensitive patient systems at Suwa Setha Hospital through multi-factor risk scoring and live facial liveness detection.
             </p>
+          </motion.div>
+
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 24, maxWidth: 800 }}>
+            <motion.div
+              whileHover={{ y: -6 }}
+              onClick={() => { setView("enroll"); setEnrollStep(0); setCaptures(0); setEnrollName(""); }}
+              style={{
+                background: "linear-gradient(145deg, #0c1017, #080b10)",
+                border: "1px solid rgba(255,255,255,0.07)",
+                borderRadius: 20, padding: 36, cursor: "pointer"
+              }}
+            >
+              <div style={{
+                width: 52, height: 52, borderRadius: 14,
+                background: "rgba(45,212,191,0.12)", display: "grid", placeItems: "center", marginBottom: 24
+              }}>
+                <UserPlus size={24} color="#2dd4bf" />
+              </div>
+              <h3 style={{ fontSize: 22, fontWeight: 600, marginBottom: 10 }}>Enrolment</h3>
+              <p style={{ color: "#64748b", fontSize: 14, lineHeight: 1.6, marginBottom: 28 }}>
+                Register a new staff biometric profile. Capture three live reference frames with real face-presence detection.
+              </p>
+              <div style={{ color: "#2dd4bf", fontWeight: 600, fontSize: 14, display: "flex", alignItems: "center", gap: 6 }}>
+                Begin Enrolment <ChevronRight size={16} />
+              </div>
+            </motion.div>
+
+            <motion.div
+              whileHover={{ y: -6 }}
+              onClick={() => { setView("login"); setPhase("idle"); setRiskData(null); }}
+              style={{
+                background: "linear-gradient(145deg, #0c1017, #080b10)",
+                border: "1px solid rgba(255,255,255,0.07)",
+                borderRadius: 20, padding: 36, cursor: "pointer"
+              }}
+            >
+              <div style={{
+                width: 52, height: 52, borderRadius: 14,
+                background: "rgba(14,165,233,0.12)", display: "grid", placeItems: "center", marginBottom: 24
+              }}>
+                <LogIn size={24} color="#38bdf8" />
+              </div>
+              <h3 style={{ fontSize: 22, fontWeight: 600, marginBottom: 10 }}>Authenticate</h3>
+              <p style={{ color: "#64748b", fontSize: 14, lineHeight: 1.6, marginBottom: 28 }}>
+                Perform a live biometric scan. AI calculates a transparent multi-factor risk score and grants or denies access.
+              </p>
+              <div style={{ color: "#38bdf8", fontWeight: 600, fontSize: 14, display: "flex", alignItems: "center", gap: 6 }}>
+                Start Secure Scan <ChevronRight size={16} />
+              </div>
+            </motion.div>
           </div>
 
-          {phase === "scanning" && scan && (
-            <div style={{ background: "#1a1a1a", padding: "20px", borderRadius: "12px", marginTop: "20px" }}>
-              {FACTORS.map((f, i) => (
-                <div key={f.key} style={{ display: "flex", justifyContent: "space-between", padding: "10px 0", borderBottom: "1px solid #222", opacity: revealCount > i ? 1 : 0.4 }}>
-                  <span>{f.label}</span>
-                  <span style={{ color: scan[f.key].pass ? "#00c4b4" : "#e63939", fontFamily: "IBM Plex Mono, monospace" }}>
-                    {scan[f.key].detail}
-                  </span>
-                </div>
-              ))}
-              <div style={{ textAlign: "center", marginTop: "20px", fontSize: "28px", fontWeight: 700, color: "#d4af37" }}>
-                RISK SCORE: {score}
-              </div>
-            </div>
-          )}
-
-          {phase === "result" && (
-            <button onClick={() => loginSuccess(role)} style={{ width: "100%", padding: "16px", background: "#d4af37", color: "#0a0a0a", border: "none", borderRadius: "8px", fontWeight: 700, marginTop: "20px" }}>
-              ACCESS GRANTED — ENTER PLATFORM
-            </button>
-          )}
-
-          <div style={{ marginTop: "30px", textAlign: "center" }}>
-            <label style={{ color: "#666" }}>
-              <input type="checkbox" checked={anomalous} onChange={e => setAnomalous(e.target.checked)} /> Simulate suspicious login
-            </label>
+          <div style={{ marginTop: 80, display: "flex", gap: 40, color: "#475569", fontSize: 13 }}>
+            <div><strong style={{ color: "#94a3b8" }}>{enrolledUsers.length}</strong> enrolled identities</div>
+            <div><strong style={{ color: "#94a3b8" }}>{auditLog.length}</strong> audit events</div>
+            <div>Real webcam liveness • Transparent risk engine</div>
           </div>
         </div>
       </div>
     );
   }
 
-  return (
-    <div style={{ background: "#0a0a0a", color: "#e8e8e8", minHeight: "100vh", fontFamily: "Inter, sans-serif" }}>
-      <style>{FONT_IMPORT}</style>
+  /* ==================== ENROLMENT ==================== */
+  if (view === "enroll") {
+    return (
+      <div style={{ minHeight: "100vh", background: "#06080c", color: "#e2e8f0", fontFamily: "Inter, system-ui, sans-serif" }}>
+        <Nav />
+        <div style={{ maxWidth: 520, margin: "0 auto", padding: "60px 24px" }}>
+          <h1 style={{ fontSize: 28, fontWeight: 700, marginBottom: 8 }}>Biometric Enrolment</h1>
+          <p style={{ color: "#64748b", marginBottom: 40 }}>
+            Explicit consent step. Three live reference frames will be captured. No raw images are stored — only a simulated template.
+          </p>
 
-      <header style={{ background: "#111", padding: "20px 40px", borderBottom: "1px solid #d4af37", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-        <div style={{ fontFamily: "Space Grotesk, sans-serif", fontSize: "26px", fontWeight: 700, color: "#d4af37" }}>SUWA SETHA HOSPITAL</div>
-        <div style={{ display: "flex", alignItems: "center", gap: "20px" }}>
-          <div style={{ color: "#00c4b4" }}>● AI PLATFORM LIVE</div>
-          <div style={{ fontFamily: "IBM Plex Mono, monospace" }}>{role.toUpperCase()} CONSOLE</div>
-          <button onClick={() => setView("login")} style={{ background: "transparent", border: "1px solid #444", color: "#aaa", padding: "8px 20px", borderRadius: "6px" }}>LOGOUT</button>
-        </div>
-      </header>
-
-      <div style={{ maxWidth: "1480px", margin: "0 auto", padding: "40px" }}>
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: "20px", marginBottom: "40px" }}>
-          <div style={{ background: "#111", padding: "24px", borderRadius: "12px", border: "1px solid #222" }}>
-            <div style={{ color: "#888", fontSize: "12px" }}>PATIENTS IN SYSTEM</div>
-            <div style={{ fontSize: "46px", fontFamily: "IBM Plex Mono, monospace", margin: "12px 0" }}>{patients}</div>
-            <div style={{ color: "#00c4b4" }}>↑ 11 vs last hour</div>
-          </div>
-          <div style={{ background: "#111", padding: "24px", borderRadius: "12px", border: "1px solid #222" }}>
-            <div style={{ color: "#888", fontSize: "12px" }}>PREDICTED AVG WAIT</div>
-            <div style={{ fontSize: "46px", fontFamily: "IBM Plex Mono, monospace", margin: "12px 0", color: "#e63939" }}>{waitTime} min</div>
-            <div style={{ color: "#d4af37" }}>Surge risk elevated</div>
-          </div>
-          <div style={{ background: "#111", padding: "24px", borderRadius: "12px", border: "1px solid #222" }}>
-            <div style={{ color: "#888", fontSize: "12px" }}>CAPACITY LOAD</div>
-            <div style={{ fontSize: "46px", fontFamily: "IBM Plex Mono, monospace", margin: "12px 0" }}>{capacity}%</div>
-            <div style={{ color: "#00c4b4" }}>Within safe threshold</div>
-          </div>
-          <div style={{ background: "#111", padding: "24px", borderRadius: "12px", border: "1px solid #222" }}>
-            <div style={{ color: "#888", fontSize: "12px" }}>2H SURGE RISK</div>
-            <div style={{ fontSize: "46px", fontFamily: "IBM Plex Mono, monospace", margin: "12px 0", color: "#e63939" }}>{surgeRisk}</div>
-            <div style={{ color: "#aaa" }}>ER + OPD overlap predicted</div>
-          </div>
-        </div>
-
-        <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr", gap: "24px", marginBottom: "30px" }}>
-          <div style={{ background: "#111", padding: "28px", borderRadius: "16px", border: "1px solid #222" }}>
-            <div style={{ color: "#d4af37", fontWeight: 600, marginBottom: "20px" }}>LIVE PATIENT FLOW PIPELINE</div>
-            <div style={{ display: "flex", justifyContent: "space-between" }}>
-              {PIPELINE_STAGES.map((s, i) => (
-                <div key={i} style={{ textAlign: "center" }}>
-                  <div style={{ fontSize: "32px", marginBottom: "8px" }}>{s.icon}</div>
-                  <div style={{ fontSize: "13px" }}>{s.name}</div>
-                  <div style={{ fontSize: "28px", color: "#00c4b4", fontFamily: "IBM Plex Mono, monospace" }}>{s.count}</div>
-                  <div style={{ fontSize: "12px", color: "#666" }}>{s.wait}</div>
-                </div>
-              ))}
+          {enrollStep === 0 && (
+            <div style={{ background: "#0c1017", border: "1px solid rgba(255,255,255,0.07)", borderRadius: 16, padding: 32 }}>
+              <label style={{ fontSize: 13, color: "#94a3b8" }}>Full Name</label>
+              <input
+                value={enrollName}
+                onChange={e => setEnrollName(e.target.value)}
+                placeholder="Dr. A. Perera"
+                style={{
+                  width: "100%", marginTop: 8, marginBottom: 20, padding: "12px 14px",
+                  background: "#06080c", border: "1px solid rgba(255,255,255,0.1)",
+                  borderRadius: 10, color: "white", fontSize: 15, outline: "none"
+                }}
+              />
+              <label style={{ fontSize: 13, color: "#94a3b8" }}>Role</label>
+              <select
+                value={enrollRole}
+                onChange={e => setEnrollRole(e.target.value)}
+                style={{
+                  width: "100%", marginTop: 8, marginBottom: 28, padding: "12px 14px",
+                  background: "#06080c", border: "1px solid rgba(255,255,255,0.1)",
+                  borderRadius: 10, color: "white", fontSize: 15
+                }}
+              >
+                {["Doctor", "Nurse", "Receptionist", "Administrator", "Lab Technician"].map(r => (
+                  <option key={r}>{r}</option>
+                ))}
+              </select>
+              <button style={{ ...primaryBtn, width: "100%", justifyContent: "center" }} onClick={startEnrolCamera}>
+                <Camera size={18} /> Enable Camera & Begin Capture
+              </button>
             </div>
-          </div>
+          )}
 
-          <div style={{ background: "#111", padding: "28px", borderRadius: "16px", border: "1px solid #d4af37" }}>
-            <div style={{ color: "#d4af37", fontWeight: 600, marginBottom: "16px" }}>AETHER AI RECOMMENDATION</div>
-            <p style={{ lineHeight: 1.6 }}>{aiInsight}</p>
-            <button onClick={applyAI} style={{ marginTop: "24px", background: "#d4af37", color: "#0a0a0a", border: "none", padding: "14px 32px", borderRadius: "8px", fontWeight: 700 }}>
-              EXECUTE RECOMMENDATION
-            </button>
-          </div>
-        </div>
-
-        <div style={{ display: "grid", gridTemplateColumns: "1.6fr 1fr", gap: "24px" }}>
-          <div style={{ background: "#111", padding: "28px", borderRadius: "16px", border: "1px solid #222" }}>
-            <div style={{ color: "#d4af37", fontWeight: 600, marginBottom: "20px" }}>PREDICTED vs ACTUAL WAIT TIME</div>
-            <div style={{ height: "280px" }}>
-              <canvas id="waitChart"></canvas>
-            </div>
-          </div>
-
-          <div style={{ background: "#111", padding: "28px", borderRadius: "16px", border: "1px solid #222" }}>
-            <div style={{ color: "#d4af37", fontWeight: 600, marginBottom: "20px" }}>PREDICTIVE ALERTS</div>
-            {ALERTS.map((a, i) => (
-              <div key={i} style={{ padding: "16px", background: "rgba(230,57,57,0.08)", borderLeft: "4px solid #e63939", marginBottom: "12px" }}>
-                <strong>{a.title}</strong>
-                <p style={{ fontSize: "13px", color: "#aaa", marginTop: "6px" }}>{a.desc}</p>
+          {enrollStep === 1 && (
+            <div style={{ background: "#0c1017", border: "1px solid rgba(255,255,255,0.07)", borderRadius: 16, padding: 32, textAlign: "center" }}>
+              <div style={{
+                width: 280, height: 280, margin: "0 auto 24px", borderRadius: "50%",
+                overflow: "hidden", border: `3px solid ${faceDetected ? "#10b981" : "#334155"}`,
+                background: "#000", position: "relative"
+              }}>
+                <video ref={videoRef} muted playsInline style={{
+                  width: "100%", height: "100%", objectFit: "cover", transform: "scaleX(-1)"
+                }} />
+                {!streamRef.current && (
+                  <div style={{ position: "absolute", inset: 0, display: "grid", placeItems: "center" }}>
+                    <CameraOff size={48} color="#475569" />
+                  </div>
+                )}
               </div>
-            ))}
-          </div>
-        </div>
 
-        <div style={{ background: "#111", padding: "28px", borderRadius: "16px", border: "1px solid #222", marginTop: "30px" }}>
-          <div style={{ color: "#d4af37", fontWeight: 600, marginBottom: "20px" }}>DEPARTMENT QUEUE LOAD</div>
-          {DEPTS.map((d, i) => (
-            <div key={i} style={{ display: "flex", alignItems: "center", gap: "20px", padding: "16px 0", borderBottom: i < DEPTS.length - 1 ? "1px solid #222" : "none" }}>
-              <div style={{ width: "160px" }}>{d.name}</div>
-              <div style={{ flex: 1, height: "10px", background: "#1f1f1f", borderRadius: "999px" }}>
-                <div style={{ width: `${d.load}%`, height: "100%", background: "linear-gradient(90deg, #00c4b4, #d4af37)" }} />
+              {cameraError && (
+                <p style={{ color: "#f59e0b", fontSize: 13, marginBottom: 12 }}>{cameraError}</p>
+              )}
+
+              <p style={{ fontSize: 14, color: faceDetected ? "#10b981" : "#94a3b8", marginBottom: 8 }}>
+                {modelsLoaded
+                  ? (faceDetected ? "Live face detected" : "Position your face in the circle")
+                  : "Loading face detection model..."}
+              </p>
+
+              <div style={{ display: "flex", justifyContent: "center", gap: 10, margin: "20px 0" }}>
+                {[0, 1, 2].map(i => (
+                  <div key={i} style={{
+                    width: 14, height: 14, borderRadius: "50%",
+                    background: captures > i ? "#10b981" : "#1e293b",
+                    border: "2px solid", borderColor: captures > i ? "#10b981" : "#334155"
+                  }} />
+                ))}
               </div>
-              <div style={{ fontFamily: "IBM Plex Mono, monospace", color: "#00c4b4", width: "60px" }}>{d.load}%</div>
-              <div style={{ fontFamily: "IBM Plex Mono, monospace", color: "#666" }}>{d.patients} patients</div>
-            </div>
-          ))}
-        </div>
+              <p style={{ fontSize: 13, color: "#64748b", marginBottom: 24 }}>
+                {captures < 3 ? `Capture ${captures + 1} of 3 — slight head turn recommended` : "All frames captured"}
+              </p>
 
-        <div style={{ textAlign: "center", marginTop: "60px", color: "#555", fontSize: "13px" }}>
-          Securing Healthcare Operations: An AI-Driven Biometric Cybersecurity Platform for Suwa Setha Hospital
+              {captures < 3 ? (
+                <button style={primaryBtn} onClick={captureFrame}>
+                  Capture Frame {captures + 1}
+                </button>
+              ) : (
+                <button style={primaryBtn} onClick={finishEnrolment}>
+                  <CheckCircle2 size={18} /> Complete Enrolment
+                </button>
+              )}
+            </div>
+          )}
+
+          {enrollStep === 2 && (
+            <div style={{ background: "#0c1017", border: "1px solid rgba(16,185,129,0.3)", borderRadius: 16, padding: 48, textAlign: "center" }}>
+              <CheckCircle2 size={56} color="#10b981" style={{ marginBottom: 20 }} />
+              <h2 style={{ fontSize: 24, marginBottom: 12 }}>Enrolment Successful</h2>
+              <p style={{ color: "#94a3b8", marginBottom: 32 }}>
+                {enrollName} ({enrollRole}) has been enrolled. You may now authenticate.
+              </p>
+              <button style={primaryBtn} onClick={() => setView("login")}>
+                Proceed to Authentication
+              </button>
+            </div>
+          )}
         </div>
       </div>
-    </div>
-  );
+    );
+  }
+
+  /* ==================== LOGIN / SCAN ==================== */
+  if (view === "login") {
+    const tier = riskData ? getTier(riskData.score) : null;
+
+    return (
+      <div style={{ minHeight: "100vh", background: "#06080c", color: "#e2e8f0", fontFamily: "Inter, system-ui, sans-serif" }}>
+        <Nav />
+        <div style={{ maxWidth: 560, margin: "0 auto", padding: "50px 24px" }}>
+          <h1 style={{ fontSize: 28, fontWeight: 700, marginBottom: 8 }}>Secure Authentication</h1>
+          <p style={{ color: "#64748b", marginBottom: 36 }}>
+            Multi-factor biometric scan with transparent AI risk scoring
+          </p>
+
+          <div style={{ background: "#0c1017", border: "1px solid rgba(255,255,255,0.07)", borderRadius: 20, padding: 36 }}>
+            {/* Camera Circle */}
+            <div style={{ textAlign: "center", marginBottom: 28 }}>
+              <div
+                onClick={phase === "idle" ? beginScan : undefined}
+                style={{
+                  width: 220, height: 220, margin: "0 auto", borderRadius: "50%",
+                  overflow: "hidden", cursor: phase === "idle" ? "pointer" : "default",
+                  border: `3px solid ${phase === "scanning" ? "#2dd4bf" : phase === "result" ? tier?.color : "#334155"}`,
+                  background: "#000", position: "relative",
+                  boxShadow: phase === "scanning" ? "0 0 40px rgba(45,212,191,0.25)" : "none"
+                }}
+              >
+                <video ref={videoRef} muted playsInline style={{
+                  width: "100%", height: "100%", objectFit: "cover", transform: "scaleX(-1)",
+                  display: phase === "scanning" ? "block" : "none"
+                }} />
+                {phase !== "scanning" && (
+                  <div style={{ position: "absolute", inset: 0, display: "grid", placeItems: "center" }}>
+                    {phase === "result" && tier ? (
+                      <tier.Icon size={64} color={tier.color} />
+                    ) : (
+                      <Camera size={56} color="#475569" />
+                    )}
+                  </div>
+                )}
+              </div>
+
+              <p style={{ marginTop: 18, fontSize: 14, color: "#94a3b8" }}>
+                {phase === "idle" && "Click the circle to begin live biometric scan"}
+                {phase === "scanning" && (faceDetected ? "Live face detected — analysing signals..." : "Scanning for live face...")}
+                {phase === "result" && tier && (
+                  <span style={{ color: tier.color, fontWeight: 600, fontSize: 16 }}>{tier.label}</span>
+                )}
+              </p>
+            </div>
+
+            {/* Risk Score */}
+            {phase === "result" && riskData && (
+              <div style={{ textAlign: "center", marginBottom: 28 }}>
+                <div style={{ fontSize: 13, color: "#64748b", marginBottom: 6 }}>AI RISK SCORE</div>
+                <div style={{ fontSize: 56, fontWeight: 700, color: tier.color, fontFamily: "IBM Plex Mono, monospace" }}>
+                  {riskData.score}
+                </div>
+                <div style={{ fontSize: 12, color: "#475569" }}>0 = fully trusted • 100 = critical risk</div>
+              </div>
+            )}
+
+            {/* Factor Breakdown */}
+            {phase === "result" && riskData && (
+              <div style={{ borderTop: "1px solid rgba(255,255,255,0.06)", paddingTop: 20 }}>
+                {FACTORS.map(f => {
+                  const data = riskData.factors[f.key];
+                  return (
+                    <div key={f.key} style={{
+                      display: "flex", justifyContent: "space-between", alignItems: "center",
+                      padding: "12px 0", borderBottom: "1px solid rgba(255,255,255,0.04)"
+                    }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                        <f.icon size={15} color="#64748b" />
+                        <span style={{ fontSize: 13 }}>{f.label}</span>
+                        <span style={{ fontSize: 11, color: "#475569" }}>w{f.weight}</span>
+                      </div>
+                      <span style={{
+                        fontSize: 12, fontFamily: "IBM Plex Mono, monospace",
+                        color: data.pass ? (data.warn ? "#f59e0b" : "#10b981") : "#ef4444",
+                        maxWidth: 210, textAlign: "right"
+                      }}>
+                        {data.detail}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {phase === "result" && tier?.level !== "high" && (
+              <button style={{ ...primaryBtn, width: "100%", justifyContent: "center", marginTop: 28 }}
+                onClick={() => alert("Access granted to clinical systems (simulated). In production this would open the patient-records console.")}>
+                Continue to Hospital Systems
+              </button>
+            )}
+
+            {phase === "result" && (
+              <button style={{ ...ghostBtn, width: "100%", marginTop: 12 }} onClick={() => { setPhase("idle"); setRiskData(null); }}>
+                <RefreshCw size={14} /> New Scan
+              </button>
+            )}
+          </div>
+
+          <label style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 24, color: "#64748b", fontSize: 13, cursor: "pointer" }}>
+            <input type="checkbox" checked={anomalous} onChange={e => setAnomalous(e.target.checked)} />
+            Demo: Simulate suspicious / anomalous login
+          </label>
+
+          {enrolledUsers.length === 0 && (
+            <p style={{ marginTop: 20, fontSize: 13, color: "#f59e0b" }}>
+              No users enrolled yet. Please complete enrolment first or the scan will be treated as high risk.
+            </p>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  /* ==================== AUDIT LOG ==================== */
+  if (view === "audit") {
+    return (
+      <div style={{ minHeight: "100vh", background: "#06080c", color: "#e2e8f0", fontFamily: "Inter, system-ui, sans-serif" }}>
+        <Nav />
+        <div style={{ maxWidth: 900, margin: "0 auto", padding: "50px 24px" }}>
+          <h1 style={{ fontSize: 28, fontWeight: 700, marginBottom: 8 }}>Access Log / Audit Trail</h1>
+          <p style={{ color: "#64748b", marginBottom: 36 }}>
+            Immutable record of authentication attempts — required for hospital security compliance.
+          </p>
+
+          <div style={{ background: "#0c1017", border: "1px solid rgba(255,255,255,0.07)", borderRadius: 16, overflow: "hidden" }}>
+            {auditLog.length === 0 ? (
+              <div style={{ padding: 60, textAlign: "center", color: "#475569" }}>No authentication events yet</div>
+            ) : (
+              auditLog.map((entry, i) => (
+                <div key={entry.id} style={{
+                  display: "grid", gridTemplateColumns: "1.2fr 1fr 1fr 80px 100px",
+                  gap: 16, padding: "16px 24px", alignItems: "center",
+                  borderBottom: i < auditLog.length - 1 ? "1px solid rgba(255,255,255,0.04)" : "none",
+                  fontSize: 13
+                }}>
+                  <div>
+                    <div style={{ fontWeight: 500 }}>{entry.user}</div>
+                    <div style={{ color: "#64748b", fontSize: 12 }}>{entry.role}</div>
+                  </div>
+                  <div style={{ color: "#94a3b8", fontFamily: "IBM Plex Mono, monospace", fontSize: 12 }}>{entry.time}</div>
+                  <div style={{ fontFamily: "IBM Plex Mono, monospace" }}>Score {entry.score}</div>
+                  <div style={{
+                    fontSize: 11, fontWeight: 600, textAlign: "center", padding: "4px 0", borderRadius: 6,
+                    background: entry.tier === "low" ? "rgba(16,185,129,0.15)" : entry.tier === "medium" ? "rgba(245,158,11,0.15)" : "rgba(239,68,68,0.15)",
+                    color: entry.tier === "low" ? "#10b981" : entry.tier === "medium" ? "#f59e0b" : "#ef4444"
+                  }}>
+                    {entry.tier.toUpperCase()}
+                  </div>
+                  <div style={{ fontWeight: 500 }}>{entry.outcome}</div>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  /* ==================== ETHICS ==================== */
+  if (view === "ethics") {
+    return (
+      <div style={{ minHeight: "100vh", background: "#06080c", color: "#e2e8f0", fontFamily: "Inter, system-ui, sans-serif" }}>
+        <Nav />
+        <div style={{ maxWidth: 720, margin: "0 auto", padding: "50px 24px" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 28 }}>
+            <Scale size={26} color="#2dd4bf" />
+            <h1 style={{ fontSize: 28, fontWeight: 700 }}>Ethics & Legal Considerations</h1>
+          </div>
+
+          <div style={{ display: "flex", flexDirection: "column", gap: 28, color: "#cbd5e1", fontSize: 15, lineHeight: 1.75 }}>
+            <section>
+              <h3 style={{ color: "#f1f5f9", marginBottom: 8 }}>Simulation Honesty</h3>
+              <p>Full biometric <strong>identity matching</strong> against a secure template database is simulated in this student prototype. Real face-presence / liveness detection runs in the browser via face-api.js, but the match percentage and final identity decision are generated by transparent weighted rules so the risk engine remains explainable for academic assessment.</p>
+            </section>
+            <section>
+              <h3 style={{ color: "#f1f5f9", marginBottom: 8 }}>Consent & Data Minimisation</h3>
+              <p>Enrolment is a separate, explicit step. In a production hospital system only an irreversible mathematical template would be stored — never the raw image. Users must be able to withdraw consent and request deletion (GDPR Art. 7 & 17 / Sri Lanka PDPA principles).</p>
+            </section>
+            <section>
+              <h3 style={{ color: "#f1f5f9", marginBottom: 8 }}>Bias & Fairness</h3>
+              <p>Facial recognition systems have documented accuracy differences across skin tone, age and gender (NIST FRVT). A real deployment requires human review for borderline scores and a non-biometric fallback pathway so no staff member is locked out of care systems.</p>
+            </section>
+            <section>
+              <h3 style={{ color: "#f1f5f9", marginBottom: 8 }}>Legal Basis</h3>
+              <p>Biometric data is “special category” data under GDPR Article 9 and equivalent regimes. Hospitals need a clear lawful basis, Data Protection Impact Assessment, strict access controls, encryption, and breach-notification procedures before going live.</p>
+            </section>
+            <section>
+              <h3 style={{ color: "#f1f5f9", marginBottom: 8 }}>Audit & Accountability</h3>
+              <p>Every authentication decision in this prototype is written to an Access Log. Real systems must retain immutable audit trails for clinical governance and regulatory inspection.</p>
+            </section>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return null;
 }
