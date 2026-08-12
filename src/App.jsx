@@ -1719,9 +1719,11 @@ export default function App() {
     setAuthFaceDetected(false);
     setAuthPhase("camera_starting");
     sfx.whoosh();
-
-    // EXTRA reliability: force camera start immediately
-    authCameraRef.current?.start();
+    // Camera start is handled reactively by <BiometricCamera autoStart={authPhase !== "idle"}>.
+    // (Previously this also called authCameraRef.current?.start() directly, which fired a
+    // *second*, concurrent getUserMedia() request a tick before the autoStart effect fired
+    // its own — two simultaneous requests to the same device is what caused the intermittent
+    // "camera already in use" / camera-never-starts error.)
   };
 
   const processAuthentication = useCallback(async () => {
