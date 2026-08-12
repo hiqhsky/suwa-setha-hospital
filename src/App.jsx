@@ -38,7 +38,6 @@ import {
   RefreshCw,
   Scale,
   Search,
-  Server,
   Settings,
   Shield,
   ShieldAlert,
@@ -52,9 +51,9 @@ import {
   Zap,
 } from "lucide-react";
 
-/* ─────────────────────────────────────────────
-   THEME TOKENS
-───────────────────────────────────────────── */
+/* ============================================================================
+   THEME
+============================================================================ */
 const T = {
   black: "#000000",
   void: "#080808",
@@ -79,12 +78,12 @@ const T = {
   bad: "#f87171",
 };
 
-/* ─────────────────────────────────────────────
-   CONSTANTS
-───────────────────────────────────────────── */
 const MODEL_URL =
   "https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.15/model/";
 
+/* ============================================================================
+   STATIC DATA
+============================================================================ */
 const ROLES = ["Doctor", "Nurse", "Administrator", "Receptionist"];
 const DEPARTMENTS = [
   "Emergency",
@@ -288,9 +287,9 @@ const pageMeta = {
   settings: { title: "Security Settings", section: "ADMINISTRATION" },
 };
 
-/* ─────────────────────────────────────────────
-   NORMALIZERS
-───────────────────────────────────────────── */
+/* ============================================================================
+   HELPERS
+============================================================================ */
 function normalizeUser(user) {
   return {
     userId: user.userId || user.staffId,
@@ -315,8 +314,8 @@ function normalizeEvent(event) {
       typeof event.timestamp === "number"
         ? event.timestamp
         : event.time
-        ? Date.parse(event.time) || Date.now()
-        : Date.now(),
+          ? Date.parse(event.time) || Date.now()
+          : Date.now(),
     riskScore: Number(event.riskScore ?? event.score ?? 0),
     riskLevel: event.riskLevel || event.tier || "high",
     outcome: event.outcome || "Denied",
@@ -326,9 +325,9 @@ function normalizeEvent(event) {
   };
 }
 
-/* ─────────────────────────────────────────────
-   DATABASE SERVICE
-───────────────────────────────────────────── */
+/* ============================================================================
+   INDEXEDDB SERVICE
+============================================================================ */
 class DatabaseService {
   constructor() {
     this.db = null;
@@ -349,6 +348,7 @@ class DatabaseService {
         reject(new Error("Database upgrade is blocked by another tab."));
       request.onupgradeneeded = (event) => {
         const database = event.target.result;
+
         const ensureStore = (name, options, indexes) => {
           const store = database.objectStoreNames.contains(name)
             ? event.target.transaction.objectStore(name)
@@ -359,11 +359,13 @@ class DatabaseService {
             }
           });
         };
+
         ensureStore("users", { keyPath: "staffId" }, [
           ["name", "name"],
           ["role", "role"],
           ["department", "department"],
         ]);
+
         ensureStore(
           "authenticationEvents",
           { keyPath: "id", autoIncrement: true },
@@ -376,22 +378,26 @@ class DatabaseService {
             ["department", "department"],
           ]
         );
+
         ensureStore("incidents", { keyPath: "id", autoIncrement: true }, [
           ["timestamp", "timestamp"],
           ["status", "status"],
           ["eventId", "eventId"],
         ]);
+
         ensureStore("alerts", { keyPath: "id", autoIncrement: true }, [
           ["timestamp", "timestamp"],
           ["read", "read"],
           ["eventId", "eventId"],
         ]);
+
         ensureStore("auditLogs", { keyPath: "id", autoIncrement: true }, [
           ["timestamp", "timestamp"],
           ["action", "action"],
           ["userId", "userId"],
         ]);
       };
+
       request.onsuccess = () => {
         this.db = request.result;
         this.db.onversionchange = () => {
@@ -429,7 +435,7 @@ class DatabaseService {
       const tx = db.transaction(storeName, "readonly");
       const store = tx.objectStore(storeName);
       const source = indexName ? store.index(indexName) : store;
-      const request = source.openCursor(null, indexName ? direction : "next");
+      const request = source.openCursor(null, direction);
       const results = [];
       request.onsuccess = (event) => {
         const cursor = event.target.result;
@@ -487,9 +493,55 @@ class DatabaseService {
 
 const db = new DatabaseService();
 
-/* ─────────────────────────────────────────────
-   CAMERA STATES
-───────────────────────────────────────────── */
+/* ============================================================================
+   FACE-API INITIALIZATION (PERFORMANCE + RELIABILITY)
+   - Fixes "camera biometrics not working" on some devices:
+     tf backend not ready + model not loaded or blocked
+============================================================================ */
+let faceInitPromise = null;
+
+async function initFaceApiOnce() {
+  if (faceInitPromise) return faceInitPromise;
+
+  faceInitPromise = (async () => {
+    // Ensure TF backend is ready and choose a fast backend when possible.
+    const tf = faceapi?.tf;
+    if (tf?.ready && tf?.setBackend) {
+      const preferred = ["webgl", "wasm", "cpu"];
+      let backendSet = false;
+      for (const b of preferred) {
+        try {
+          // Some builds may not have wasm; ignore failures.
+          // eslint-disable-next-line no-await-in-loop
+          await tf.setBackend(b);
+          // eslint-disable-next-line no-await-in-loop
+          await tf.ready();
+          backendSet = true;
+          break;
+        } catch {
+          // try next backend
+        }
+      }
+      if (!backendSet) {
+        await tf.ready();
+      }
+    }
+
+    await faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL);
+    return true;
+  })();
+
+  try {
+    return await faceInitPromise;
+  } catch (e) {
+    faceInitPromise = null;
+    throw e;
+  }
+}
+
+/* ============================================================================
+   CAMERA
+============================================================================ */
 const CameraStates = {
   IDLE: "idle",
   LOADING_MODEL: "loading_model",
@@ -501,168 +553,234 @@ const CameraStates = {
   ERROR: "error",
 };
 
-/* ─────────────────────────────────────────────
-   FACE MODEL LOADER (singleton)
-───────────────────────────────────────────── */
-let faceModelPromise = null;
-async function loadFaceModel() {
-  if (faceModelPromise) return faceModelPromise;
-  faceModelPromise = faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL);
-  try {
-    await faceModelPromise;
-    return true;
-  } catch (error) {
-    faceModelPromise = null;
-    throw error;
-  }
-}
-
-/* ─────────────────────────────────────────────
-   BIOMETRIC CAMERA COMPONENT
-───────────────────────────────────────────── */
 const BiometricCamera = forwardRef(function BiometricCamera(
-  { autoStart = false, showGuide = true, onFaceDetected, onStateChange, onError },
+  {
+    autoStart = false,
+    showGuide = true,
+    onFaceDetected,
+    onStateChange,
+    onError,
+    // performance knobs (optional; does not remove any feature)
+    detectionMs = 450, // lower FPS = less lag (default tuned for low-end laptops)
+    detectionMsWhenDetected = 700,
+    inputSize = 192, // smaller = faster; 160/192 works well for presence detection
+    scoreThreshold = 0.45,
+    videoConstraints,
+  },
   ref
 ) {
   const [state, setState] = useState(CameraStates.IDLE);
   const [faceDetected, setFaceDetected] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
+
   const videoRef = useRef(null);
   const streamRef = useRef(null);
-  const detectionTimerRef = useRef(null);
-  const detectionBusyRef = useRef(false);
+
   const mountedRef = useRef(true);
   const startTokenRef = useRef(0);
+
+  const timerRef = useRef(null);
+  const busyRef = useRef(false);
+
   const faceCallbackRef = useRef(onFaceDetected);
   const stateCallbackRef = useRef(onStateChange);
   const errorCallbackRef = useRef(onError);
 
+  const lastDetectedRef = useRef(false);
+  const lastStateRef = useRef(CameraStates.IDLE);
+
   useEffect(() => {
     faceCallbackRef.current = onFaceDetected;
   }, [onFaceDetected]);
+
   useEffect(() => {
     stateCallbackRef.current = onStateChange;
   }, [onStateChange]);
+
   useEffect(() => {
     errorCallbackRef.current = onError;
   }, [onError]);
 
-  const updateState = useCallback(
-    (next) => {
-      if (!mountedRef.current) return;
-      setState(next);
-      stateCallbackRef.current?.(next);
-    },
-    []
-  );
+  const emitState = useCallback((next) => {
+    if (!mountedRef.current) return;
+    if (lastStateRef.current === next) return;
+    lastStateRef.current = next;
+    setState(next);
+    stateCallbackRef.current?.(next);
+  }, []);
+
+  const emitDetected = useCallback((detected) => {
+    if (!mountedRef.current) return;
+    if (lastDetectedRef.current === detected) return;
+    lastDetectedRef.current = detected;
+    setFaceDetected(detected);
+    faceCallbackRef.current?.(detected);
+  }, []);
+
+  const clearLoop = useCallback(() => {
+    if (timerRef.current) {
+      clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
+    busyRef.current = false;
+  }, []);
 
   const stop = useCallback(() => {
     startTokenRef.current += 1;
-    if (detectionTimerRef.current) {
-      clearInterval(detectionTimerRef.current);
-      detectionTimerRef.current = null;
-    }
-    detectionBusyRef.current = false;
+    clearLoop();
+
     if (streamRef.current) {
-      streamRef.current.getTracks().forEach((track) => track.stop());
+      streamRef.current.getTracks().forEach((t) => t.stop());
       streamRef.current = null;
     }
-    if (videoRef.current) {
+
+    const video = videoRef.current;
+    if (video) {
       try {
-        videoRef.current.pause();
-      } catch {}
-      videoRef.current.srcObject = null;
+        video.pause();
+      } catch {
+        // ignore
+      }
+      video.srcObject = null;
     }
+
     if (mountedRef.current) {
-      setFaceDetected(false);
-      updateState(CameraStates.IDLE);
-      faceCallbackRef.current?.(false);
+      emitDetected(false);
+      emitState(CameraStates.IDLE);
     }
-  }, [updateState]);
+  }, [clearLoop, emitDetected, emitState]);
 
   const detectOnce = useCallback(async () => {
-    if (
-      !mountedRef.current ||
-      !videoRef.current ||
-      videoRef.current.readyState < 2 ||
-      detectionBusyRef.current
-    )
-      return;
-    detectionBusyRef.current = true;
+    const video = videoRef.current;
+    if (!mountedRef.current) return;
+    if (!video || video.readyState < 2) return;
+    if (!streamRef.current) return;
+    if (busyRef.current) return;
+
+    busyRef.current = true;
     try {
       const detection = await faceapi.detectSingleFace(
-        videoRef.current,
+        video,
         new faceapi.TinyFaceDetectorOptions({
-          inputSize: 320,
-          scoreThreshold: 0.5,
+          inputSize,
+          scoreThreshold,
         })
       );
+
       if (!mountedRef.current) return;
+
       const detected = Boolean(detection);
-      setFaceDetected(detected);
-      faceCallbackRef.current?.(detected);
-      updateState(detected ? CameraStates.DETECTED : CameraStates.DETECTING);
-    } catch (error) {
-      console.warn("Face detection error", error);
+      emitDetected(detected);
+      emitState(detected ? CameraStates.DETECTED : CameraStates.DETECTING);
+    } catch (e) {
+      // do not hard-fail on detect errors; keep running
+      // console.warn("Face detection error", e);
     } finally {
-      detectionBusyRef.current = false;
+      busyRef.current = false;
     }
-  }, [updateState]);
+  }, [emitDetected, emitState, inputSize, scoreThreshold]);
+
+  const scheduleLoop = useCallback(
+    (token) => {
+      if (!mountedRef.current) return;
+      if (token !== startTokenRef.current) return;
+      if (!streamRef.current) return;
+
+      const delay = lastDetectedRef.current
+        ? detectionMsWhenDetected
+        : detectionMs;
+
+      timerRef.current = setTimeout(async () => {
+        await detectOnce();
+        scheduleLoop(token);
+      }, delay);
+    },
+    [detectOnce, detectionMs, detectionMsWhenDetected]
+  );
 
   const start = useCallback(async () => {
     const token = ++startTokenRef.current;
+
     stop();
-    updateState(CameraStates.LOADING_MODEL);
+    emitState(CameraStates.LOADING_MODEL);
     setErrorMessage("");
+
     try {
-      await loadFaceModel();
+      if (!window.isSecureContext) {
+        throw new Error(
+          "Camera requires a secure context (HTTPS or localhost)."
+        );
+      }
+
+      await initFaceApiOnce();
       if (!mountedRef.current || token !== startTokenRef.current) return;
-      if (!navigator.mediaDevices?.getUserMedia)
+
+      if (!navigator.mediaDevices?.getUserMedia) {
         throw new Error("This browser does not support webcam access.");
-      updateState(CameraStates.REQUESTING);
+      }
+
+      emitState(CameraStates.REQUESTING);
+
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
+        video: videoConstraints || {
           facingMode: "user",
-          width: { ideal: 1280 },
-          height: { ideal: 720 },
+          width: { ideal: 960 },
+          height: { ideal: 540 },
         },
         audio: false,
       });
+
       if (!mountedRef.current || token !== startTokenRef.current) {
-        stream.getTracks().forEach((track) => track.stop());
+        stream.getTracks().forEach((t) => t.stop());
         return;
       }
+
       streamRef.current = stream;
-      updateState(CameraStates.INITIALIZING);
+      emitState(CameraStates.INITIALIZING);
+
       const video = videoRef.current;
       if (!video) throw new Error("Camera video element is unavailable.");
+
       video.srcObject = stream;
+
       await new Promise((resolve, reject) => {
-        let done = false;
-        const finish = () => {
-          if (!done) {
-            done = true;
-            video.removeEventListener("loadedmetadata", finish);
-            resolve();
-          }
+        let settled = false;
+        const done = () => {
+          if (settled) return;
+          settled = true;
+          resolve();
         };
-        video.addEventListener("loadedmetadata", finish, { once: true });
-        if (video.readyState >= 1) finish();
-        setTimeout(() => (done ? null : finish()), 3000);
-        setTimeout(() => {
-          if (!done)
-            reject(new Error("Camera stream did not become ready."));
-        }, 5000);
+        const fail = (err) => {
+          if (settled) return;
+          settled = true;
+          reject(err);
+        };
+
+        const onLoaded = () => {
+          video.removeEventListener("loadedmetadata", onLoaded);
+          done();
+        };
+
+        video.addEventListener("loadedmetadata", onLoaded, { once: true });
+
+        // safety
+        setTimeout(() => done(), 3000);
+        setTimeout(() => fail(new Error("Camera stream did not become ready.")), 8000);
       });
+
       await video.play();
+
       if (!mountedRef.current || token !== startTokenRef.current) return;
-      updateState(CameraStates.READY);
+
+      emitState(CameraStates.READY);
+
+      // First detect quickly, then loop
       await detectOnce();
-      if (mountedRef.current && token === startTokenRef.current) {
-        detectionTimerRef.current = setInterval(detectOnce, 500);
-      }
+      clearLoop();
+      scheduleLoop(token);
     } catch (error) {
       if (!mountedRef.current || token !== startTokenRef.current) return;
+
       let message = "Camera access failed.";
       if (error?.name === "NotAllowedError")
         message =
@@ -672,31 +790,37 @@ const BiometricCamera = forwardRef(function BiometricCamera(
       else if (error?.name === "NotReadableError")
         message = "The camera is already being used by another application.";
       else if (error?.message) message = error.message;
+
       setErrorMessage(message);
-      updateState(CameraStates.ERROR);
+      emitState(CameraStates.ERROR);
       errorCallbackRef.current?.(message);
+
+      // ensure stream closed
+      stop();
+      // but keep ERROR state
+      if (mountedRef.current) emitState(CameraStates.ERROR);
     }
-  }, [detectOnce, stop, updateState]);
+  }, [clearLoop, detectOnce, emitState, stop, scheduleLoop, videoConstraints]);
 
   const captureFrame = useCallback(() => {
-    if (
-      !videoRef.current ||
-      videoRef.current.readyState < 2 ||
-      !streamRef.current ||
-      !faceDetected
-    )
-      return null;
     const video = videoRef.current;
+    if (!video || video.readyState < 2) return null;
+    if (!streamRef.current) return null;
+    if (!lastDetectedRef.current) return null;
+
     const canvas = document.createElement("canvas");
-    canvas.width = video.videoWidth || 1280;
-    canvas.height = video.videoHeight || 720;
+    canvas.width = video.videoWidth || 960;
+    canvas.height = video.videoHeight || 540;
     const ctx = canvas.getContext("2d");
     if (!ctx) return null;
+
+    // mirror to match preview
     ctx.translate(canvas.width, 0);
     ctx.scale(-1, 1);
     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
     return canvas.toDataURL("image/jpeg", 0.86);
-  }, [faceDetected]);
+  }, []);
 
   useImperativeHandle(
     ref,
@@ -704,48 +828,62 @@ const BiometricCamera = forwardRef(function BiometricCamera(
       start,
       stop,
       captureFrame,
-      isFaceDetected: () => faceDetected,
+      isFaceDetected: () => lastDetectedRef.current,
       isReady: () =>
-        [
-          CameraStates.READY,
-          CameraStates.DETECTING,
-          CameraStates.DETECTED,
-        ].includes(state),
-      getState: () => state,
+        [CameraStates.READY, CameraStates.DETECTING, CameraStates.DETECTED].includes(
+          lastStateRef.current
+        ),
+      getState: () => lastStateRef.current,
     }),
-    [captureFrame, faceDetected, start, state, stop]
+    [captureFrame, start, stop]
   );
 
+  // IMPORTANT FIX:
+  // react to autoStart changes (your previous laggy/broken behavior often came from
+  // camera not starting when authPhase changed -> autoStart became true).
   useEffect(() => {
     mountedRef.current = true;
+
     if (autoStart) start();
+    else stop();
+
     return () => {
       mountedRef.current = false;
       stop();
     };
-  }, []);// eslint-disable-line react-hooks/exhaustive-deps
+  }, [autoStart, start, stop]);
 
-  const statusMap = {
-    [CameraStates.IDLE]: "CAMERA OFFLINE",
-    [CameraStates.LOADING_MODEL]: "INITIALIZING BIOMETRIC ENGINE",
-    [CameraStates.REQUESTING]: "REQUESTING CAMERA...",
-    [CameraStates.INITIALIZING]: "INITIALIZING STREAM...",
-    [CameraStates.READY]: "CAMERA ONLINE",
-    [CameraStates.DETECTING]: "SEARCHING FOR FACE...",
-    [CameraStates.DETECTED]: "FACE DETECTED",
-    [CameraStates.ERROR]: "CAMERA ERROR",
-  };
+  // Pause detection loop when tab is hidden to reduce CPU lag
+  useEffect(() => {
+    const onVis = () => {
+      if (document.visibilityState === "hidden") clearLoop();
+      else if (streamRef.current) scheduleLoop(startTokenRef.current);
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+  }, [clearLoop, scheduleLoop]);
 
-  const statusLabel = statusMap[state] || "CAMERA OFFLINE";
+  const statusLabel =
+    {
+      [CameraStates.IDLE]: "CAMERA OFFLINE",
+      [CameraStates.LOADING_MODEL]: "INITIALIZING BIOMETRIC ENGINE",
+      [CameraStates.REQUESTING]: "REQUESTING CAMERA...",
+      [CameraStates.INITIALIZING]: "INITIALIZING STREAM...",
+      [CameraStates.READY]: "CAMERA ONLINE",
+      [CameraStates.DETECTING]: "SEARCHING FOR FACE...",
+      [CameraStates.DETECTED]: "FACE DETECTED",
+      [CameraStates.ERROR]: "CAMERA ERROR",
+    }[state] || "CAMERA";
+
   const statusColor =
     state === CameraStates.ERROR
       ? T.bad
       : state === CameraStates.DETECTED
-      ? T.white
-      : T.muted;
+        ? T.white
+        : T.muted;
 
   return (
-    <div className="camera-wrap">
+    <div>
       <div className="scanner-frame">
         <video
           ref={videoRef}
@@ -755,25 +893,25 @@ const BiometricCamera = forwardRef(function BiometricCamera(
           className="scanner-video"
           aria-label="Biometric camera preview"
         />
+
         {showGuide && state !== CameraStates.ERROR && (
           <>
-            <div
-              className={`face-guide ${faceDetected ? "face-guide-active" : ""}`}
-            />
+            <div className={`face-guide ${faceDetected ? "face-guide-active" : ""}`} />
             <div className="scanner-corner tl" />
             <div className="scanner-corner tr" />
             <div className="scanner-corner bl" />
             <div className="scanner-corner br" />
           </>
         )}
-        {(state === CameraStates.DETECTING ||
-          state === CameraStates.DETECTED) && (
+
+        {(state === CameraStates.DETECTING || state === CameraStates.DETECTED) && (
           <motion.div
             animate={{ top: ["8%", "92%", "8%"] }}
             transition={{ duration: 2.3, repeat: Infinity, ease: "linear" }}
             className="scan-line"
           />
         )}
+
         {state === CameraStates.ERROR && (
           <div className="camera-error">
             <CameraOff size={42} />
@@ -785,9 +923,11 @@ const BiometricCamera = forwardRef(function BiometricCamera(
           </div>
         )}
       </div>
+
       <div className="camera-status" style={{ color: statusColor }}>
         {statusLabel}
       </div>
+
       {!autoStart && state === CameraStates.IDLE && (
         <div className="center mt-16">
           <MangaButton icon={Camera} onClick={start}>
@@ -799,38 +939,59 @@ const BiometricCamera = forwardRef(function BiometricCamera(
   );
 });
 
-/* ─────────────────────────────────────────────
-   AUDIO HOOK
-───────────────────────────────────────────── */
+/* ============================================================================
+   SMALL PERFORMANCE FIX: CLOCK DOES NOT RE-RENDER ENTIRE APP
+============================================================================ */
+function LiveClock({ className = "clock" }) {
+  const [clock, setClock] = useState(() =>
+    new Date().toLocaleTimeString("en-GB", {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    })
+  );
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setClock(
+        new Date().toLocaleTimeString("en-GB", {
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit",
+        })
+      );
+    }, 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  return <span className={className}>{clock}</span>;
+}
+
+/* ============================================================================
+   AUDIO
+============================================================================ */
 function useAudio() {
   const ctxRef = useRef(null);
-  const tone = useCallback(
-    (freq, duration, type = "sine", volume = 0.025) => {
-      try {
-        if (!ctxRef.current)
-          ctxRef.current = new (window.AudioContext ||
-            window.webkitAudioContext)();
-        const ctx = ctxRef.current;
-        if (ctx.state === "suspended") ctx.resume();
-        const osc = ctx.createOscillator();
-        const gain = ctx.createGain();
-        osc.type = type;
-        osc.frequency.value = freq;
-        gain.gain.setValueAtTime(volume, ctx.currentTime);
-        gain.gain.exponentialRampToValueAtTime(
-          0.001,
-          ctx.currentTime + duration
-        );
-        osc.connect(gain);
-        gain.connect(ctx.destination);
-        osc.start();
-        osc.stop(ctx.currentTime + duration);
-      } catch {
-        // Audio is non-critical.
-      }
-    },
-    []
-  );
+  const tone = useCallback((freq, duration, type = "sine", volume = 0.025) => {
+    try {
+      if (!ctxRef.current)
+        ctxRef.current = new (window.AudioContext || window.webkitAudioContext)();
+      const ctx = ctxRef.current;
+      if (ctx.state === "suspended") ctx.resume();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = type;
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(volume, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + duration);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start();
+      osc.stop(ctx.currentTime + duration);
+    } catch {
+      // non-critical
+    }
+  }, []);
   return {
     tap: () => tone(760, 0.045, "sine", 0.018),
     success: () => tone(620, 0.1, "sine", 0.02),
@@ -839,9 +1000,9 @@ function useAudio() {
   };
 }
 
-/* ─────────────────────────────────────────────
-   ATMOSPHERE CANVAS
-───────────────────────────────────────────── */
+/* ============================================================================
+   VISUALS
+============================================================================ */
 function Atmosphere() {
   const ref = useRef(null);
   useEffect(() => {
@@ -849,49 +1010,56 @@ function Atmosphere() {
     if (!canvas) return undefined;
     const ctx = canvas.getContext("2d");
     if (!ctx) return undefined;
+
     let width = window.innerWidth;
     let height = window.innerHeight;
     let animationId = 0;
+
     const points = Array.from({ length: 34 }, () => ({
       x: Math.random(),
       y: Math.random(),
       vx: (Math.random() - 0.5) * 0.00015,
       vy: (Math.random() - 0.5) * 0.00015,
     }));
+
     const resize = () => {
       width = window.innerWidth;
       height = window.innerHeight;
       canvas.width = width;
       canvas.height = height;
     };
-    resize();
+
     const render = () => {
       ctx.clearRect(0, 0, width, height);
-      points.forEach((point) => {
-        point.x += point.vx;
-        point.y += point.vy;
-        if (point.x < 0 || point.x > 1) point.vx *= -1;
-        if (point.y < 0 || point.y > 1) point.vy *= -1;
+      points.forEach((p) => {
+        p.x += p.vx;
+        p.y += p.vy;
+        if (p.x < 0 || p.x > 1) p.vx *= -1;
+        if (p.y < 0 || p.y > 1) p.vy *= -1;
         ctx.fillStyle = "rgba(255,255,255,0.06)";
         ctx.beginPath();
-        ctx.arc(point.x * width, point.y * height, 1, 0, Math.PI * 2);
+        ctx.arc(p.x * width, p.y * height, 1, 0, Math.PI * 2);
         ctx.fill();
       });
       animationId = requestAnimationFrame(render);
     };
+
+    resize();
     window.addEventListener("resize", resize);
     render();
+
     return () => {
       cancelAnimationFrame(animationId);
       window.removeEventListener("resize", resize);
     };
   }, []);
+
   return <canvas ref={ref} className="atmosphere" aria-hidden="true" />;
 }
 
-/* ─────────────────────────────────────────────
-   SHARED UI PRIMITIVES
-───────────────────────────────────────────── */
+/* ============================================================================
+   UI PRIMITIVES
+============================================================================ */
 function MangaPanel({ children, className = "", style, hover = false }) {
   return (
     <motion.div
@@ -942,9 +1110,9 @@ function MangaSelect({ label, value, onChange, options }) {
     <label className="field">
       {label && <span>{label}</span>}
       <select value={value} onChange={onChange}>
-        {options.map((option) => (
-          <option key={option} value={option}>
-            {option}
+        {options.map((opt) => (
+          <option key={opt} value={opt}>
+            {opt}
           </option>
         ))}
       </select>
@@ -966,9 +1134,7 @@ function SectionHeader({ eyebrow, title, description, action }) {
 }
 
 function StatusPill({ children, tone = "neutral" }) {
-  return (
-    <span className={`status-pill status-${tone}`}>{children}</span>
-  );
+  return <span className={`status-pill status-${tone}`}>{children}</span>;
 }
 
 function StatCard({ label, value, icon: Icon, detail }) {
@@ -1038,6 +1204,7 @@ function calculateRisk({ enrolled, anomalous = false, failed, scenario = "standa
     attempts: failures === 0 ? 0 : failures <= 2 ? 10 : 35,
     biometric: enrolled ? 4 : 28,
   };
+
   if (scenario === "elevated") {
     factor.device = 15;
     factor.location = 10;
@@ -1045,6 +1212,7 @@ function calculateRisk({ enrolled, anomalous = false, failed, scenario = "standa
     factor.attempts = Math.max(factor.attempts, 10);
     factor.biometric = 8;
   }
+
   if (anomalous || scenario === "suspicious") {
     factor.device = 25;
     factor.location = 30;
@@ -1052,48 +1220,32 @@ function calculateRisk({ enrolled, anomalous = false, failed, scenario = "standa
     factor.attempts = Math.max(factor.attempts, 10);
     factor.biometric = 18;
   }
-  const score = Math.min(
-    100,
-    Object.values(factor).reduce((sum, value) => sum + value, 0)
-  );
+
+  const score = Math.min(100, Object.values(factor).reduce((s, v) => s + v, 0));
+
   return {
     score,
     factors: [
       {
         label: "Device Recognition",
         value: factor.device,
-        desc:
-          factor.device <= 5
-            ? "Known hospital workstation"
-            : "Unrecognized device",
+        desc: factor.device <= 5 ? "Known hospital workstation" : "Unrecognized device",
       },
       {
         label: "Network Location",
         value: factor.location,
-        desc:
-          factor.location <= 5
-            ? "Internal hospital network"
-            : "Unfamiliar location",
+        desc: factor.location <= 5 ? "Internal hospital network" : "Unfamiliar location",
       },
       {
         label: "Time Pattern",
         value: factor.time,
-        desc:
-          factor.time <= 5
-            ? "Normal shift pattern"
-            : "Unusual access hour",
+        desc: factor.time <= 5 ? "Normal shift pattern" : "Unusual access hour",
       },
-      {
-        label: "Failed Attempts",
-        value: factor.attempts,
-        desc: `${failures} recent failures`,
-      },
+      { label: "Failed Attempts", value: factor.attempts, desc: `${failures} recent failures` },
       {
         label: "Biometric Presence",
         value: factor.biometric,
-        desc: enrolled
-          ? "Live face detected · prototype match stage"
-          : "No enrolled profile",
+        desc: enrolled ? "Live face detected · prototype match stage" : "No enrolled profile",
       },
     ],
   };
@@ -1130,8 +1282,7 @@ function Modal({ title, children, onClose }) {
 }
 
 function EventTable({ events, compact = false }) {
-  if (!events.length)
-    return <EmptyState text="No authentication events yet." />;
+  if (!events.length) return <EmptyState text="No authentication events yet." />;
   return (
     <div className="event-table-wrap">
       <table className="event-table">
@@ -1161,8 +1312,8 @@ function EventTable({ events, compact = false }) {
                     event.outcome === "Granted"
                       ? "good"
                       : event.outcome === "Step-up"
-                      ? "warn"
-                      : "bad"
+                        ? "warn"
+                        : "bad"
                   }
                 >
                   {event.outcome}
@@ -1186,8 +1337,8 @@ function InsightCard({ insight, large = false }) {
             insight.severity === "high"
               ? "bad"
               : insight.severity === "medium"
-              ? "warn"
-              : "good"
+                ? "warn"
+                : "good"
           }
         >
           {insight.severity}
@@ -1201,1451 +1352,33 @@ function InsightCard({ insight, large = false }) {
   );
 }
 
-/* ─────────────────────────────────────────────
-   GLOBAL STYLES  (injected once at runtime)
-───────────────────────────────────────────── */
-const STYLES = `
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
-  :root {
-    --bg: #0c0c0c;
-    --panel: #181818;
-    --panel2: #202020;
-    --graphite: #2b2b2b;
-    --steel: #414141;
-    --line: rgba(255,255,255,.10);
-    --line2: rgba(255,255,255,.05);
-    --lineStrong: rgba(255,255,255,.18);
-    --text: #f5f5f5;
-    --muted: #b7b7b7;
-    --dim: #747474;
-    --good: #4ade80;
-    --warn: #facc15;
-    --bad: #f87171;
-    --radius: 10px;
-  }
-
-  html, body, #root {
-    height: 100%;
-    background: var(--bg);
-    color: var(--text);
-    font-family: 'Inter', 'Segoe UI', system-ui, sans-serif;
-    font-size: 14px;
-    line-height: 1.6;
-    -webkit-font-smoothing: antialiased;
-  }
-
-  /* ── ATMOSPHERE ── */
-  .atmosphere {
-    position: fixed;
-    inset: 0;
-    pointer-events: none;
-    z-index: 0;
-  }
-
-  /* ── APP SHELL ── */
-  .app-shell {
-    position: relative;
-    min-height: 100vh;
-    z-index: 1;
-  }
-
-  /* ── PUBLIC NAV ── */
-  .public-nav {
-    position: sticky;
-    top: 0;
-    z-index: 100;
-    display: flex;
-    align-items: center;
-    gap: 16px;
-    padding: 0 24px;
-    height: 60px;
-    background: rgba(12,12,12,.92);
-    backdrop-filter: blur(16px);
-    border-bottom: 1px solid var(--line);
-    flex-wrap: wrap;
-  }
-
-  .brand {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    background: none;
-    border: none;
-    color: var(--text);
-    cursor: pointer;
-    padding: 0;
-    text-align: left;
-    flex-shrink: 0;
-  }
-
-  .brand-mark {
-    width: 34px;
-    height: 34px;
-    border-radius: 8px;
-    background: var(--panel2);
-    border: 1px solid var(--line);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-  }
-
-  .brand strong { display: block; font-size: 13px; letter-spacing: .08em; }
-  .brand small { display: block; font-size: 10px; color: var(--muted); letter-spacing: .06em; }
-
-  .public-links {
-    display: flex;
-    gap: 4px;
-    flex: 1;
-  }
-
-  .public-links button {
-    background: none;
-    border: none;
-    color: var(--muted);
-    cursor: pointer;
-    padding: 6px 12px;
-    border-radius: 6px;
-    font-size: 13px;
-    transition: color .15s, background .15s;
-  }
-
-  .public-links button:hover,
-  .public-links button.active {
-    color: var(--text);
-    background: var(--panel2);
-  }
-
-  .public-actions {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-  }
-
-  .clock {
-    font-size: 12px;
-    font-variant-numeric: tabular-nums;
-    color: var(--dim);
-    letter-spacing: .05em;
-  }
-
-  .mobile-menu-btn {
-    display: none;
-    background: none;
-    border: none;
-    color: var(--text);
-    cursor: pointer;
-    padding: 6px;
-  }
-
-  .mobile-public-menu {
-    position: absolute;
-    top: 60px;
-    left: 0;
-    right: 0;
-    background: rgba(12,12,12,.98);
-    border-bottom: 1px solid var(--line);
-    padding: 12px 24px;
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    overflow: hidden;
-    z-index: 200;
-  }
-
-  .mobile-public-menu button {
-    background: none;
-    border: none;
-    color: var(--muted);
-    cursor: pointer;
-    padding: 10px 0;
-    text-align: left;
-    font-size: 14px;
-    border-bottom: 1px solid var(--line2);
-  }
-
-  .mobile-menu-actions {
-    display: flex;
-    gap: 10px;
-    padding-top: 10px;
-  }
-
-  /* ── MANGA PANEL ── */
-  .manga-panel {
-    background: var(--panel);
-    border: 1px solid var(--line);
-    border-radius: var(--radius);
-    padding: 20px;
-    position: relative;
-    transition: border-color .2s;
-  }
-
-  /* ── MANGA BUTTON ── */
-  .manga-button {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    border: none;
-    border-radius: 8px;
-    padding: 9px 18px;
-    font-size: 13px;
-    font-weight: 600;
-    cursor: pointer;
-    letter-spacing: .04em;
-    transition: opacity .15s;
-    white-space: nowrap;
-  }
-
-  .manga-button:disabled {
-    opacity: .4;
-    cursor: not-allowed;
-  }
-
-  .manga-button-primary {
-    background: var(--text);
-    color: #000;
-  }
-
-  .manga-button-secondary {
-    background: var(--panel2);
-    color: var(--text);
-    border: 1px solid var(--line);
-  }
-
-  .manga-button-ghost {
-    background: transparent;
-    color: var(--muted);
-    border: 1px solid var(--line);
-  }
-
-  .manga-button-ghost:hover { color: var(--text); }
-
-  /* ── FIELD ── */
-  .field {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-  }
-
-  .field span {
-    font-size: 11px;
-    letter-spacing: .08em;
-    color: var(--muted);
-    text-transform: uppercase;
-  }
-
-  .field input,
-  .field select {
-    background: var(--panel2);
-    border: 1px solid var(--line);
-    border-radius: 7px;
-    color: var(--text);
-    padding: 9px 12px;
-    font-size: 13px;
-    outline: none;
-    transition: border-color .15s;
-    width: 100%;
-  }
-
-  .field input:focus,
-  .field select:focus {
-    border-color: var(--lineStrong);
-  }
-
-  .field select option { background: #1a1a1a; }
-
-  /* ── SECTION HEADER ── */
-  .section-header {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 16px;
-    margin-bottom: 20px;
-    flex-wrap: wrap;
-  }
-
-  .section-header h2 {
-    font-size: 22px;
-    font-weight: 700;
-    line-height: 1.2;
-    letter-spacing: -.01em;
-  }
-
-  .section-header p {
-    color: var(--muted);
-    margin-top: 6px;
-    max-width: 560px;
-    font-size: 13px;
-  }
-
-  /* ── EYEBROW ── */
-  .eyebrow {
-    font-size: 10px;
-    letter-spacing: .12em;
-    color: var(--dim);
-    text-transform: uppercase;
-    margin-bottom: 4px;
-  }
-
-  /* ── STATUS PILL ── */
-  .status-pill {
-    display: inline-flex;
-    align-items: center;
-    padding: 3px 9px;
-    border-radius: 20px;
-    font-size: 10px;
-    font-weight: 700;
-    letter-spacing: .08em;
-    text-transform: uppercase;
-  }
-
-  .status-good { background: rgba(74,222,128,.15); color: var(--good); border: 1px solid rgba(74,222,128,.3); }
-  .status-warn { background: rgba(250,204,21,.12); color: var(--warn); border: 1px solid rgba(250,204,21,.3); }
-  .status-bad  { background: rgba(248,113,113,.12); color: var(--bad); border: 1px solid rgba(248,113,113,.3); }
-  .status-neutral { background: var(--panel2); color: var(--muted); border: 1px solid var(--line); }
-
-  /* ── STAT CARD ── */
-  .stat-card { padding: 18px; }
-  .stat-top { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
-  .stat-card strong { font-size: 28px; font-weight: 800; display: block; }
-  .stat-card small { color: var(--muted); font-size: 12px; margin-top: 4px; display: block; }
-
-  /* ── PROGRESS BAR ── */
-  .progress-track {
-    height: 4px;
-    background: var(--graphite);
-    border-radius: 4px;
-    overflow: hidden;
-    margin-top: 4px;
-  }
-
-  .progress-value {
-    height: 100%;
-    background: var(--text);
-    border-radius: 4px;
-  }
-
-  /* ── GRIDS ── */
-  .stats-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-    gap: 14px;
-  }
-
-  .two-col {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 14px;
-  }
-
-  .architecture-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-    gap: 14px;
-  }
-
-  .capability-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-    gap: 14px;
-  }
-
-  /* ── TOAST ── */
-  .toast {
-    position: fixed;
-    bottom: 28px;
-    left: 50%;
-    transform: translateX(-50%);
-    background: var(--panel2);
-    border: 1px solid var(--lineStrong);
-    border-radius: 8px;
-    padding: 10px 20px;
-    font-size: 13px;
-    color: var(--text);
-    z-index: 9999;
-    pointer-events: none;
-    white-space: nowrap;
-    box-shadow: 0 8px 32px rgba(0,0,0,.6);
-  }
-
-  /* ── MODAL ── */
-  .modal-backdrop {
-    position: fixed;
-    inset: 0;
-    background: rgba(0,0,0,.75);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    z-index: 1000;
-    padding: 20px;
-  }
-
-  .modal {
-    background: var(--panel);
-    border: 1px solid var(--line);
-    border-radius: 12px;
-    padding: 24px;
-    width: 100%;
-    max-width: 500px;
-    max-height: 90vh;
-    overflow-y: auto;
-  }
-
-  .modal-top {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    margin-bottom: 18px;
-  }
-
-  .modal-top h3 { font-size: 17px; font-weight: 700; }
-
-  .modal-top button {
-    background: none;
-    border: none;
-    color: var(--muted);
-    cursor: pointer;
-    padding: 4px;
-  }
-
-  .modal-note {
-    color: var(--muted);
-    font-size: 13px;
-    margin-top: 14px;
-    padding-top: 14px;
-    border-top: 1px solid var(--line);
-  }
-
-  /* ── EVENT TABLE ── */
-  .event-table-wrap { overflow-x: auto; }
-
-  .event-table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 13px;
-  }
-
-  .event-table th {
-    text-align: left;
-    font-size: 10px;
-    letter-spacing: .1em;
-    color: var(--dim);
-    padding: 8px 12px;
-    border-bottom: 1px solid var(--line2);
-  }
-
-  .event-table td {
-    padding: 10px 12px;
-    border-bottom: 1px solid var(--line2);
-    vertical-align: middle;
-  }
-
-  .event-table td strong { display: block; font-size: 13px; }
-  .event-table td small  { display: block; font-size: 11px; color: var(--dim); margin-top: 2px; }
-  .event-table tbody tr:hover { background: var(--panel2); }
-
-  /* ── EMPTY STATE ── */
-  .empty-state {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 10px;
-    padding: 48px 24px;
-    color: var(--dim);
-    text-align: center;
-  }
-
-  /* ── INSIGHT CARD ── */
-  .insight-card {
-    background: var(--panel2);
-    border: 1px solid var(--line);
-    border-radius: 8px;
-    padding: 16px;
-  }
-
-  .insight-large { padding: 20px; }
-  .insight-top { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
-  .insight-card h3 { font-size: 15px; font-weight: 700; margin-bottom: 6px; }
-  .insight-card p  { font-size: 13px; color: var(--muted); margin-bottom: 6px; }
-  .insight-card small { font-size: 11px; color: var(--dim); }
-
-  /* ── STACK LIST ── */
-  .stack-list { display: flex; flex-direction: column; gap: 12px; }
-
-  /* ── PAGE STACK ── */
-  .page-stack { display: flex; flex-direction: column; gap: 20px; }
-
-  /* ── DASHBOARD SHELL ── */
-  .dashboard-shell {
-    display: flex;
-    min-height: 100vh;
-  }
-
-  .dashboard-sidebar {
-    width: 240px;
-    flex-shrink: 0;
-    background: rgba(12,12,12,.96);
-    border-right: 1px solid var(--line);
-    display: flex;
-    flex-direction: column;
-    position: sticky;
-    top: 0;
-    height: 100vh;
-    overflow-y: auto;
-    z-index: 50;
-  }
-
-  .sidebar-top {
-    padding: 16px;
-    border-bottom: 1px solid var(--line2);
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-  }
-
-  .sidebar-brand {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-  }
-
-  .sidebar-brand strong { font-size: 12px; letter-spacing: .08em; display: block; }
-  .sidebar-brand small  { font-size: 10px; color: var(--dim); display: block; }
-
-  .sidebar-user {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    padding: 16px;
-    border-bottom: 1px solid var(--line2);
-  }
-
-  .avatar {
-    width: 36px;
-    height: 36px;
-    border-radius: 8px;
-    background: var(--graphite);
-    border: 1px solid var(--line);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 12px;
-    font-weight: 700;
-    letter-spacing: .04em;
-    flex-shrink: 0;
-  }
-
-  .sidebar-user strong { font-size: 13px; font-weight: 600; display: block; }
-  .sidebar-user small  { font-size: 11px; color: var(--dim); display: block; margin-top: 2px; }
-
-  .dashboard-nav { flex: 1; padding: 12px 0; overflow-y: auto; }
-
-  .nav-group { margin-bottom: 12px; }
-
-  .nav-group-title {
-    font-size: 9px;
-    letter-spacing: .14em;
-    color: var(--dim);
-    text-transform: uppercase;
-    padding: 6px 16px;
-  }
-
-  .dashboard-nav button {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    width: 100%;
-    background: none;
-    border: none;
-    color: var(--muted);
-    cursor: pointer;
-    padding: 8px 16px;
-    font-size: 13px;
-    text-align: left;
-    border-radius: 0;
-    transition: color .15s, background .15s;
-    position: relative;
-  }
-
-  .dashboard-nav button:hover,
-  .dashboard-nav button.active {
-    color: var(--text);
-    background: var(--panel2);
-  }
-
-  .dashboard-nav button.active {
-    border-left: 2px solid var(--text);
-  }
-
-  .nav-badge {
-    margin-left: auto;
-    background: var(--bad);
-    color: #fff;
-    font-size: 10px;
-    font-weight: 700;
-    border-radius: 10px;
-    padding: 1px 6px;
-  }
-
-  .sidebar-bottom {
-    padding: 16px;
-    border-top: 1px solid var(--line2);
-  }
-
-  .dashboard-main {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    min-width: 0;
-  }
-
-  .dashboard-topbar {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 16px 24px;
-    border-bottom: 1px solid var(--line);
-    background: rgba(12,12,12,.8);
-    backdrop-filter: blur(12px);
-    position: sticky;
-    top: 0;
-    z-index: 40;
-    gap: 12px;
-    flex-wrap: wrap;
-  }
-
-  .topbar-left { display: flex; align-items: center; gap: 14px; }
-  .topbar-left h1 { font-size: 18px; font-weight: 700; }
-  .topbar-right { display: flex; align-items: center; gap: 12px; }
-
-  .dashboard-content { padding: 24px; flex: 1; }
-
-  /* ── SIDEBAR CLOSE BUTTON ── */
-  .sidebar-close {
-    background: none;
-    border: none;
-    color: var(--muted);
-    cursor: pointer;
-    padding: 4px;
-  }
-
-  .drawer-overlay {
-    position: fixed;
-    inset: 0;
-    background: rgba(0,0,0,.5);
-    z-index: 45;
-  }
-
-  /* ── MOBILE ── */
-  .mobile-only { display: none !important; }
-
-  @media (max-width: 768px) {
-    .mobile-only { display: flex !important; }
-    .dashboard-sidebar { position: fixed; top: 0; left: 0; bottom: 0; transform: translateX(-100%); transition: transform .3s; }
-    .dashboard-sidebar.mobile-open { transform: translateX(0); }
-    .two-col { grid-template-columns: 1fr; }
-    .public-links { display: none; }
-    .public-actions { display: none; }
-    .mobile-menu-btn { display: flex !important; }
-    .stats-grid { grid-template-columns: repeat(2, 1fr); }
-  }
-
-  /* ── LANDING ── */
-  .landing { padding: 0 24px 60px; }
-
-  .landing-hero {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 40px;
-    padding: 80px 0 60px;
-    flex-wrap: wrap;
-  }
-
-  .hero-copy { max-width: 560px; }
-
-  .hero-eyebrow {
-    font-size: 10px;
-    letter-spacing: .14em;
-    color: var(--dim);
-    text-transform: uppercase;
-    margin-bottom: 20px;
-  }
-
-  .hero-copy h1 {
-    font-size: clamp(38px, 6vw, 68px);
-    font-weight: 900;
-    line-height: 1.0;
-    letter-spacing: -.03em;
-    margin-bottom: 22px;
-  }
-
-  .hero-copy h1 span { color: var(--dim); }
-
-  .hero-copy p {
-    color: var(--muted);
-    font-size: 15px;
-    max-width: 440px;
-    line-height: 1.65;
-    margin-bottom: 28px;
-  }
-
-  .hero-scanner { flex-shrink: 0; }
-
-  .hero-circle {
-    width: 260px;
-    height: 260px;
-    border-radius: 50%;
-    border: 1px solid var(--line);
-    background: var(--panel);
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: 14px;
-    color: var(--muted);
-    text-align: center;
-    font-size: 10px;
-    letter-spacing: .12em;
-    text-transform: uppercase;
-  }
-
-  .public-section {
-    padding-top: 40px;
-    border-top: 1px solid var(--line2);
-  }
-
-  /* ── PUBLIC PAGE ── */
-  .public-page {
-    max-width: 960px;
-    margin: 0 auto;
-    padding: 40px 24px 80px;
-  }
-
-  .narrow { max-width: 620px; }
-
-  /* ── HERO PANEL ── */
-  .hero-panel {
-    background: var(--panel);
-    border: 1px solid var(--line);
-    border-radius: var(--radius);
-    padding: 28px;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 24px;
-    flex-wrap: wrap;
-    margin-bottom: 20px;
-  }
-
-  .hero-panel h2 { font-size: 20px; font-weight: 800; margin-top: 4px; }
-  .hero-panel p  { color: var(--muted); font-size: 13px; margin-top: 8px; max-width: 480px; }
-
-  .hero-score {
-    text-align: center;
-    flex-shrink: 0;
-  }
-
-  .hero-score span  { font-size: 10px; letter-spacing: .1em; color: var(--dim); display: block; }
-  .hero-score strong { font-size: 52px; font-weight: 900; display: block; }
-  .hero-score small  { font-size: 13px; color: var(--muted); }
-
-  /* ── CAMERA ── */
-  .camera-wrap { display: flex; flex-direction: column; gap: 10px; }
-
-  .scanner-frame {
-    position: relative;
-    width: 100%;
-    aspect-ratio: 16/9;
-    background: #000;
-    border-radius: 8px;
-    overflow: hidden;
-    border: 1px solid var(--line);
-  }
-
-  .scanner-video {
-    width: 100%;
-    height: 100%;
-    object-fit: cover;
-    transform: scaleX(-1);
-    display: block;
-  }
-
-  .face-guide {
-    position: absolute;
-    top: 50%;
-    left: 50%;
-    transform: translate(-50%, -50%);
-    width: 180px;
-    height: 220px;
-    border-radius: 50%;
-    border: 2px solid rgba(255,255,255,.2);
-    transition: border-color .3s;
-    pointer-events: none;
-  }
-
-  .face-guide-active { border-color: var(--good); box-shadow: 0 0 20px rgba(74,222,128,.2); }
-
-  .scanner-corner {
-    position: absolute;
-    width: 20px;
-    height: 20px;
-    border-color: var(--text);
-    border-style: solid;
-    pointer-events: none;
-  }
-
-  .scanner-corner.tl { top: 12px; left: 12px; border-width: 2px 0 0 2px; border-radius: 2px 0 0 0; }
-  .scanner-corner.tr { top: 12px; right: 12px; border-width: 2px 2px 0 0; border-radius: 0 2px 0 0; }
-  .scanner-corner.bl { bottom: 12px; left: 12px; border-width: 0 0 2px 2px; border-radius: 0 0 0 2px; }
-  .scanner-corner.br { bottom: 12px; right: 12px; border-width: 0 2px 2px 0; border-radius: 0 0 2px 0; }
-
-  .scan-line {
-    position: absolute;
-    left: 0;
-    right: 0;
-    height: 2px;
-    background: linear-gradient(90deg, transparent, var(--good), transparent);
-    opacity: .7;
-    pointer-events: none;
-  }
-
-  .camera-error {
-    position: absolute;
-    inset: 0;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: 12px;
-    background: rgba(0,0,0,.85);
-    color: var(--bad);
-    text-align: center;
-    padding: 20px;
-  }
-
-  .camera-error strong { font-size: 14px; letter-spacing: .08em; }
-  .camera-error span   { font-size: 12px; color: var(--muted); max-width: 300px; }
-
-  .camera-status {
-    font-size: 10px;
-    letter-spacing: .12em;
-    text-transform: uppercase;
-    text-align: center;
-  }
-
-  /* ── ENROLLMENT STEPS ── */
-  .progress-steps {
-    display: flex;
-    gap: 8px;
-    margin-bottom: 24px;
-    overflow-x: auto;
-    padding-bottom: 4px;
-  }
-
-  .step {
-    display: flex;
-    align-items: center;
-    gap: 7px;
-    font-size: 11px;
-    letter-spacing: .08em;
-    text-transform: uppercase;
-    color: var(--dim);
-    white-space: nowrap;
-  }
-
-  .step span {
-    width: 22px;
-    height: 22px;
-    border-radius: 50%;
-    background: var(--graphite);
-    border: 1px solid var(--line);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 11px;
-    font-weight: 700;
-  }
-
-  .step.active { color: var(--text); }
-  .step.active span { background: var(--text); color: #000; border-color: var(--text); }
-
-  /* ── CAPTURE STRIP ── */
-  .capture-strip {
-    display: flex;
-    gap: 10px;
-    margin: 16px 0;
-  }
-
-  .capture-box {
-    flex: 1;
-    aspect-ratio: 4/3;
-    border-radius: 6px;
-    background: var(--panel2);
-    border: 1px dashed var(--line);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    color: var(--dim);
-    font-size: 18px;
-    font-weight: 700;
-    overflow: hidden;
-  }
-
-  .capture-box img {
-    width: 100%;
-    height: 100%;
-    object-fit: cover;
-    border-radius: 6px;
-  }
-
-  .confirm-strip img {
-    flex: 1;
-    aspect-ratio: 4/3;
-    object-fit: cover;
-    border-radius: 6px;
-    max-width: 100%;
-  }
-
-  /* ── CONSENT BOX ── */
-  .consent-box {
-    display: flex;
-    align-items: flex-start;
-    gap: 10px;
-    padding: 14px;
-    background: var(--panel2);
-    border: 1px solid var(--line);
-    border-radius: 8px;
-    margin: 16px 0;
-    cursor: pointer;
-    font-size: 13px;
-    color: var(--muted);
-  }
-
-  .consent-box input { margin-top: 2px; flex-shrink: 0; }
-
-  /* ── SUCCESS SCREEN ── */
-  .success-screen {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 14px;
-    padding: 32px 20px;
-    text-align: center;
-    color: var(--good);
-  }
-
-  .success-screen h3 { color: var(--text); font-size: 20px; }
-  .success-screen p  { color: var(--muted); font-size: 13px; }
-
-  /* ── FORM GRID ── */
-  .form-grid {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 14px;
-    margin-bottom: 18px;
-  }
-
-  /* ── CENTER ── */
-  .center { display: flex; justify-content: center; }
-  .center-icon { display: flex; justify-content: center; margin-bottom: 14px; color: var(--dim); }
-  .center-text { text-align: center; color: var(--muted); margin: 12px 0; font-size: 13px; }
-  .mt-16 { margin-top: 16px; }
-
-  /* ── BUTTON ROW ── */
-  .button-row {
-    display: flex;
-    gap: 10px;
-    flex-wrap: wrap;
-    margin-top: 16px;
-  }
-
-  .button-row.center { justify-content: center; }
-
-  /* ── LOGIN PAGE ── */
-  .login-page { gap: 16px; }
-
-  .selected-identity {
-    display: flex;
-    align-items: center;
-    gap: 14px;
-    margin-top: 14px;
-    padding-top: 14px;
-    border-top: 1px solid var(--line2);
-  }
-
-  .selected-identity span  { font-size: 10px; letter-spacing: .1em; color: var(--dim); display: block; }
-  .selected-identity strong { font-size: 15px; display: block; margin-top: 2px; }
-  .selected-identity small  { font-size: 12px; color: var(--muted); display: block; margin-top: 2px; }
-
-  .login-scanner-panel { display: flex; flex-direction: column; gap: 14px; }
-
-  .auth-phase-label {
-    font-size: 10px;
-    letter-spacing: .14em;
-    color: var(--dim);
-    text-align: center;
-    text-transform: uppercase;
-  }
-
-  .scanner-idle {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 14px;
-    padding: 48px 24px;
-    color: var(--dim);
-    text-align: center;
-  }
-
-  .scanner-idle p { font-size: 11px; letter-spacing: .08em; max-width: 220px; }
-
-  .scan-meta {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 18px;
-    font-size: 11px;
-    color: var(--dim);
-    letter-spacing: .08em;
-  }
-
-  .scan-meta span { display: flex; align-items: center; gap: 6px; }
-
-  /* ── AUTH RESULT ── */
-  .auth-result {
-    display: flex;
-    flex-direction: column;
-    gap: 16px;
-    align-items: center;
-    padding-top: 8px;
-    width: 100%;
-  }
-
-  .risk-score {
-    text-align: center;
-    padding: 20px;
-    background: var(--panel2);
-    border-radius: 10px;
-    border: 1px solid var(--line);
-    width: 100%;
-  }
-
-  .risk-score span  { font-size: 10px; letter-spacing: .12em; color: var(--dim); display: block; margin-bottom: 6px; }
-  .risk-score strong { font-size: 54px; font-weight: 900; display: block; line-height: 1; }
-  .risk-score small  { font-size: 13px; color: var(--muted); }
-
-  .risk-factors {
-    width: 100%;
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
-  }
-
-  .risk-factor { display: flex; flex-direction: column; gap: 4px; }
-
-  .risk-factor > div {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    font-size: 12px;
-  }
-
-  .risk-factor > div span  { color: var(--muted); }
-  .risk-factor > div strong { font-weight: 700; }
-  .risk-factor small { font-size: 11px; color: var(--dim); }
-
-  /* ── OTP BOX ── */
-  .otp-box {
-    width: 100%;
-    background: var(--panel2);
-    border: 1px solid var(--line);
-    border-radius: 8px;
-    padding: 16px;
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-    align-items: flex-start;
-  }
-
-  .otp-row {
-    display: flex;
-    gap: 10px;
-    width: 100%;
-  }
-
-  .otp-row input {
-    flex: 1;
-    background: var(--panel);
-    border: 1px solid var(--line);
-    border-radius: 6px;
-    color: var(--text);
-    padding: 9px 12px;
-    font-size: 18px;
-    letter-spacing: .16em;
-    text-align: center;
-    outline: none;
-    transition: border-color .15s;
-  }
-
-  .otp-row input:focus { border-color: var(--lineStrong); }
-  .otp-box small { font-size: 11px; color: var(--dim); }
-
-  /* ── DENIED / SUCCESS BOXES ── */
-  .denied-box {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 10px;
-    padding: 24px;
-    background: rgba(248,113,113,.07);
-    border: 1px solid rgba(248,113,113,.2);
-    border-radius: 10px;
-    color: var(--bad);
-    text-align: center;
-    width: 100%;
-  }
-
-  .denied-box strong { font-size: 16px; letter-spacing: .08em; }
-  .denied-box span   { font-size: 12px; color: var(--muted); }
-
-  .success-box {
-    display: flex;
-    align-items: center;
-    gap: 16px;
-    padding: 20px;
-    background: rgba(74,222,128,.07);
-    border: 1px solid rgba(74,222,128,.2);
-    border-radius: 10px;
-    color: var(--good);
-    width: 100%;
-    flex-wrap: wrap;
-  }
-
-  .success-box > div { flex: 1; }
-  .success-box strong { font-size: 15px; letter-spacing: .06em; display: block; }
-  .success-box span   { font-size: 12px; color: var(--muted); display: block; margin-top: 4px; }
-
-  /* ── PROTOTYPE NOTE ── */
-  .prototype-note {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    font-size: 12px;
-    color: var(--muted);
-    border-color: var(--line2);
-  }
-
-  .prototype-note strong { color: var(--dim); font-size: 11px; letter-spacing: .08em; text-transform: uppercase; }
-
-  /* ── ERROR BANNER ── */
-  .error-banner {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 10px 14px;
-    background: rgba(248,113,113,.08);
-    border: 1px solid rgba(248,113,113,.2);
-    border-radius: 7px;
-    color: var(--bad);
-    font-size: 13px;
-  }
-
-  /* ── PATIENT RECORDS ── */
-  .patient-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
-    gap: 14px;
-  }
-
-  .patient-card {
-    background: var(--panel);
-    border: 1px solid var(--line);
-    border-radius: var(--radius);
-    padding: 18px;
-    cursor: pointer;
-    text-align: left;
-    color: var(--text);
-    transition: border-color .2s, transform .15s;
-    width: 100%;
-  }
-
-  .patient-card:hover { border-color: var(--lineStrong); transform: translateY(-2px); }
-
-  .patient-card-top {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    margin-bottom: 10px;
-  }
-
-  .patient-card-top span { font-size: 11px; color: var(--dim); }
-  .patient-card strong { font-size: 15px; font-weight: 700; display: block; margin-bottom: 4px; }
-  .patient-card small  { font-size: 12px; color: var(--muted); display: block; margin-bottom: 10px; }
-
-  .patient-vitals {
-    display: flex;
-    gap: 10px;
-    flex-wrap: wrap;
-    margin-top: 8px;
-  }
-
-  .patient-vitals span {
-    font-size: 11px;
-    background: var(--panel2);
-    border: 1px solid var(--line2);
-    border-radius: 4px;
-    padding: 3px 8px;
-    color: var(--muted);
-  }
-
-  /* ── DETAIL GRID ── */
-  .detail-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
-    gap: 12px;
-    margin: 14px 0;
-  }
-
-  .detail-grid > div { display: flex; flex-direction: column; gap: 4px; }
-  .detail-grid span  { font-size: 10px; letter-spacing: .08em; color: var(--dim); text-transform: uppercase; }
-  .detail-grid strong { font-size: 14px; font-weight: 700; }
-
-  /* ── BAR CHART ── */
-  .bar-chart { display: flex; flex-direction: column; gap: 12px; margin-top: 10px; }
-
-  .bar-item { display: flex; flex-direction: column; gap: 4px; }
-
-  .bar-label {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    font-size: 12px;
-  }
-
-  .bar-label span  { color: var(--muted); }
-  .bar-label strong { font-weight: 700; }
-
-  /* ── TIMELINE ── */
-  .timeline { display: flex; flex-direction: column; gap: 0; padding-left: 24px; border-left: 1px solid var(--line); }
-
-  .timeline-item {
-    display: flex;
-    gap: 18px;
-    position: relative;
-    padding-bottom: 20px;
-  }
-
-  .timeline-dot {
-    position: absolute;
-    left: -29px;
-    top: 4px;
-    width: 10px;
-    height: 10px;
-    border-radius: 50%;
-    background: var(--steel);
-    border: 2px solid var(--graphite);
-    flex-shrink: 0;
-  }
-
-  .timeline-card {
-    flex: 1;
-    background: var(--panel2);
-    border: 1px solid var(--line2);
-    border-radius: 8px;
-    padding: 14px;
-  }
-
-  .timeline-top {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    margin-bottom: 6px;
-    gap: 12px;
-    flex-wrap: wrap;
-  }
-
-  .timeline-top strong { font-size: 14px; font-weight: 700; }
-  .timeline-top span   { font-size: 11px; color: var(--dim); }
-  .timeline-card > div { font-size: 13px; margin-bottom: 4px; }
-  .timeline-card small { font-size: 11px; color: var(--dim); }
-
-  /* ── INCIDENT LIST ── */
-  .incident-list { display: flex; flex-direction: column; gap: 14px; }
-
-  .incident-top {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 14px;
-    margin-bottom: 14px;
-    flex-wrap: wrap;
-  }
-
-  .incident-top h3 { font-size: 15px; font-weight: 700; margin-top: 4px; }
-
-  /* ── ALERT READ ── */
-  .alert-read { opacity: .55; }
-
-  /* ── FILTER GRID ── */
-  .filter-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-    gap: 14px;
-    align-items: flex-end;
-  }
-
-  /* ── HEALTH GRID ── */
-  .health-grid { display: flex; flex-direction: column; gap: 10px; }
-
-  .health-row > div {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    flex: 1;
-  }
-
-  .health-row {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 14px 18px;
-    flex-wrap: wrap;
-    gap: 12px;
-  }
-
-  .health-row strong { font-size: 14px; font-weight: 600; display: block; }
-  .health-row small  { font-size: 11px; color: var(--dim); display: block; margin-top: 2px; }
-
-  /* ── SETTINGS ── */
-  .settings-section { display: flex; flex-direction: column; gap: 0; }
-
-  .setting-row {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 14px 0;
-    border-bottom: 1px solid var(--line2);
-    gap: 16px;
-    flex-wrap: wrap;
-  }
-
-  .setting-row:last-child { border-bottom: none; }
-  .setting-row strong { font-size: 14px; font-weight: 600; display: block; }
-  .setting-row small  { font-size: 12px; color: var(--dim); display: block; margin-top: 3px; }
-
-  /* ── POSTURE ── */
-  .posture-large {
-    display: flex;
-    align-items: center;
-    gap: 32px;
-    flex-wrap: wrap;
-    padding-top: 10px;
-  }
-
-  .posture-ring {
-    width: 120px;
-    height: 120px;
-    border-radius: 50%;
-    border: 3px solid var(--line);
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    flex-shrink: 0;
-  }
-
-  .posture-good { border-color: var(--good); }
-  .posture-warn { border-color: var(--warn); }
-  .posture-bad  { border-color: var(--bad);  }
-
-  .posture-ring strong { font-size: 34px; font-weight: 900; }
-  .posture-ring span   { font-size: 12px; color: var(--muted); }
-
-  .posture-factors {
-    display: grid;
-    grid-template-columns: repeat(2, 1fr);
-    gap: 16px;
-    flex: 1;
-  }
-
-  .posture-factors > div { display: flex; flex-direction: column; gap: 4px; }
-  .posture-factors span  { font-size: 11px; color: var(--dim); }
-  .posture-factors strong { font-size: 18px; font-weight: 800; }
-
-  /* ── AUDIT TABLE ── */
-  .audit-table { display: flex; flex-direction: column; gap: 0; }
-
-  .audit-row {
-    display: grid;
-    grid-template-columns: 1fr auto;
-    gap: 10px 20px;
-    padding: 12px 0;
-    border-bottom: 1px solid var(--line2);
-    align-items: start;
-  }
-
-  .audit-row:last-child { border-bottom: none; }
-  .audit-row strong { font-size: 13px; font-weight: 700; display: block; }
-  .audit-row small  { font-size: 11px; color: var(--dim); display: block; margin-top: 2px; }
-  .audit-row span   { font-size: 11px; color: var(--dim); white-space: nowrap; }
-  .audit-row p      { grid-column: 1 / -1; font-size: 12px; color: var(--muted); margin: 0; }
-
-  /* ── PANEL NUMBER ── */
-  .panel-number {
-    font-size: 11px;
-    font-weight: 700;
-    letter-spacing: .1em;
-    color: var(--dim);
-    display: block;
-    margin-bottom: 8px;
-  }
-
-  /* ── SCROLLBAR ── */
-  ::-webkit-scrollbar { width: 6px; height: 6px; }
-  ::-webkit-scrollbar-track { background: transparent; }
-  ::-webkit-scrollbar-thumb { background: var(--graphite); border-radius: 3px; }
-`;
-
-/* ─────────────────────────────────────────────
-   STYLE INJECTOR
-───────────────────────────────────────────── */
-function StyleInjector() {
-  useEffect(() => {
-    const id = "suwa-setha-styles";
-    if (document.getElementById(id)) return;
-    const style = document.createElement("style");
-    style.id = id;
-    style.textContent = STYLES;
-    document.head.appendChild(style);
-    return () => {
-      const el = document.getElementById(id);
-      if (el) el.remove();
-    };
-  }, []);
-  return null;
-}
-
-/* ─────────────────────────────────────────────
-   MAIN APP
-───────────────────────────────────────────── */
+/* ============================================================================
+   APP
+============================================================================ */
 export default function App() {
   const sfx = useAudio();
+
   const [view, setView] = useState("landing");
   const [dashboardTab, setDashboardTab] = useState("overview");
+
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [mobileDashboardMenu, setMobileDashboardMenu] = useState(false);
-  const [clock, setClock] = useState("");
+
   const [toast, setToast] = useState("");
+
   const [dbState, setDbState] = useState("initializing");
   const [faceModelState, setFaceModelState] = useState("loading");
+
   const [users, setUsers] = useState([]);
   const [authEvents, setAuthEvents] = useState([]);
   const [incidents, setIncidents] = useState([]);
   const [alerts, setAlerts] = useState([]);
   const [auditLogs, setAuditLogs] = useState([]);
+
   const [session, setSession] = useState(null);
+
   const [selectedPatient, setSelectedPatient] = useState(null);
+
   const [filterSearch, setFilterSearch] = useState("");
   const [filterDept, setFilterDept] = useState("All");
   const [filterOutcome, setFilterOutcome] = useState("All");
@@ -2676,29 +1409,12 @@ export default function App() {
   const authCameraRef = useRef(null);
   const processingTimerRef = useRef(null);
 
-  /* ── CLOCK ── */
-  useEffect(() => {
-    const tick = () =>
-      setClock(
-        new Date().toLocaleTimeString("en-GB", {
-          hour: "2-digit",
-          minute: "2-digit",
-          second: "2-digit",
-        })
-      );
-    tick();
-    const timer = setInterval(tick, 1000);
-    return () => clearInterval(timer);
-  }, []);
-
-  /* ── TOAST AUTO-DISMISS ── */
   useEffect(() => {
     if (!toast) return undefined;
     const timer = setTimeout(() => setToast(""), 3200);
     return () => clearTimeout(timer);
   }, [toast]);
 
-  /* ── DATA REFRESH ── */
   const refreshData = useCallback(async () => {
     const [usersData, eventsData, incidentsData, alertsData, auditsData] =
       await Promise.all([
@@ -2715,28 +1431,29 @@ export default function App() {
     setAuditLogs(auditsData);
   }, []);
 
-  /* ── INIT ── */
   useEffect(() => {
     let mounted = true;
+
     db.init()
       .then(() => refreshData())
       .then(() => mounted && setDbState("ready"))
-      .catch((error) => {
-        console.error(error);
+      .catch((e) => {
+        console.error(e);
         if (mounted) setDbState("error");
       });
-    loadFaceModel()
+
+    initFaceApiOnce()
       .then(() => mounted && setFaceModelState("ready"))
-      .catch((error) => {
-        console.error(error);
+      .catch((e) => {
+        console.error(e);
         if (mounted) setFaceModelState("error");
       });
+
     return () => {
       mounted = false;
     };
   }, [refreshData]);
 
-  /* ── PROCESSING TIMER CLEANUP ── */
   useEffect(
     () => () => {
       if (processingTimerRef.current) clearTimeout(processingTimerRef.current);
@@ -2768,17 +1485,14 @@ export default function App() {
       setMobileMenuOpen(false);
       setMobileDashboardMenu(false);
       setView(nextView);
+
       if (nextView === "enroll") {
         setEnrollStep(0);
         setEnrollConsent(false);
         setEnrollCaptures([]);
-        setEnrollForm({
-          name: "",
-          staffId: "",
-          role: "Doctor",
-          department: "Emergency",
-        });
+        setEnrollForm({ name: "", staffId: "", role: "Doctor", department: "Emergency" });
       }
+
       if (nextView === "login") {
         setAuthSelectedStaffId("");
         setAuthPhase("idle");
@@ -2789,57 +1503,46 @@ export default function App() {
         setAuthOtpActive(false);
         setAuthError("");
       }
+
       if (nextView === "dashboard") setDashboardTab("overview");
     },
     [leaveCameras, sfx]
   );
 
   const selectedAuthUser = useMemo(
-    () => users.find((user) => user.staffId === authSelectedStaffId) || null,
+    () => users.find((u) => u.staffId === authSelectedStaffId) || null,
     [authSelectedStaffId, users]
   );
 
-  const accessibleNavItems = useMemo(
-    () =>
-      dashboardNav
-        .map((section) => ({
-          ...section,
-          items: section.items.filter((item) =>
-            item.roles.includes(session?.role)
-          ),
-        }))
-        .filter((section) => section.items.length > 0),
-    [session]
-  );
+  const accessibleNavItems = useMemo(() => {
+    return dashboardNav
+      .map((section) => ({
+        ...section,
+        items: section.items.filter((item) => item.roles.includes(session?.role)),
+      }))
+      .filter((section) => section.items.length > 0);
+  }, [session]);
 
-  /* ── ANALYTICS ── */
   const analytics = useMemo(() => {
     const total = authEvents.length;
     const granted = authEvents.filter((e) => e.outcome === "Granted").length;
     const stepUp = authEvents.filter((e) => e.outcome === "Step-up").length;
     const denied = authEvents.filter((e) => e.outcome === "Denied").length;
+
     const avgRisk = total
-      ? Math.round(
-          authEvents.reduce((sum, e) => sum + Number(e.riskScore || 0), 0) /
-            total
-        )
+      ? Math.round(authEvents.reduce((s, e) => s + Number(e.riskScore || 0), 0) / total)
       : 0;
-    const openIncidents = incidents.filter(
-      (i) => i.status !== "Resolved"
-    ).length;
+
+    const openIncidents = incidents.filter((i) => i.status !== "Resolved").length;
     const highRisk = authEvents.filter((e) => e.riskLevel === "high").length;
     const unreadAlerts = alerts.filter((a) => !a.read).length;
     const successRate = total ? Math.round((granted / total) * 100) : 0;
+
     const posture = Math.max(
       0,
-      Math.min(
-        100,
-        100 -
-          denied * 3 -
-          openIncidents * 5 -
-          (avgRisk > 50 ? 12 : 0)
-      )
+      Math.min(100, 100 - denied * 3 - openIncidents * 5 - (avgRisk > 50 ? 12 : 0))
     );
+
     return {
       total,
       granted,
@@ -2854,72 +1557,61 @@ export default function App() {
     };
   }, [alerts, authEvents, incidents]);
 
-  const filteredEvents = useMemo(
-    () =>
-      authEvents.filter((event) => {
-        const q = filterSearch.trim().toLowerCase();
-        const matchSearch =
-          !q ||
-          `${event.userName} ${event.staffId}`.toLowerCase().includes(q);
-        const matchDept =
-          filterDept === "All" || event.department === filterDept;
-        const matchOutcome =
-          filterOutcome === "All" || event.outcome === filterOutcome;
-        return matchSearch && matchDept && matchOutcome;
-      }),
-    [authEvents, filterDept, filterOutcome, filterSearch]
-  );
+  const filteredEvents = useMemo(() => {
+    return authEvents.filter((event) => {
+      const q = filterSearch.trim().toLowerCase();
+      const matchSearch = !q || `${event.userName} ${event.staffId}`.toLowerCase().includes(q);
+      const matchDept = filterDept === "All" || event.department === filterDept;
+      const matchOutcome = filterOutcome === "All" || event.outcome === filterOutcome;
+      return matchSearch && matchDept && matchOutcome;
+    });
+  }, [authEvents, filterDept, filterOutcome, filterSearch]);
 
-  /* ── AI INSIGHTS ── */
   const aiInsights = useMemo(() => {
     const insights = [];
     const failedByUser = {};
-    authEvents.forEach((event) => {
-      if (event.outcome !== "Granted")
-        failedByUser[event.userName] =
-          (failedByUser[event.userName] || 0) + 1;
+
+    authEvents.forEach((e) => {
+      if (e.outcome !== "Granted") failedByUser[e.userName] = (failedByUser[e.userName] || 0) + 1;
     });
-    const repeaters = Object.entries(failedByUser).filter(
-      ([, count]) => count >= 3
-    );
+
+    const repeaters = Object.entries(failedByUser).filter(([, count]) => count >= 3);
     if (repeaters.length) {
       insights.push({
         severity: "high",
         title: "Repeated Authentication Failures",
-        evidence: `${repeaters
-          .map(([name, count]) => `${name} (${count})`)
-          .join(", ")}`,
-        recommendation:
-          "Review the affected enrollment and recent access activity.",
+        evidence: `${repeaters.map(([name, count]) => `${name} (${count})`).join(", ")}`,
+        recommendation: "Review the affected enrollment and recent access activity.",
       });
     }
+
     if (analytics.total >= 5 && analytics.denied / analytics.total > 0.25) {
       insights.push({
         severity: "high",
         title: "Elevated Denial Rate",
         evidence: `${analytics.denied} of ${analytics.total} recent attempts were denied.`,
-        recommendation:
-          "Review device, network and failed-attempt patterns.",
+        recommendation: "Review device, network and failed-attempt patterns.",
       });
     }
+
     if (analytics.avgRisk > 45 && analytics.total >= 4) {
       insights.push({
         severity: "medium",
         title: "Elevated Average Risk",
         evidence: `Average risk is ${analytics.avgRisk}/100 across ${analytics.total} events.`,
-        recommendation:
-          "Review unusual device, time and location factors.",
+        recommendation: "Review unusual device, time and location factors.",
       });
     }
+
     if (analytics.openIncidents > 0) {
       insights.push({
         severity: "high",
         title: "Open Security Incidents",
         evidence: `${analytics.openIncidents} incident(s) remain unresolved.`,
-        recommendation:
-          "Review the Incident Centre and close resolved cases.",
+        recommendation: "Review the Incident Centre and close resolved cases.",
       });
     }
+
     if (!insights.length) {
       insights.push({
         severity: "low",
@@ -2928,17 +1620,12 @@ export default function App() {
         recommendation: "Continue normal monitoring.",
       });
     }
+
     return insights;
   }, [analytics, authEvents]);
 
-  const postureTone =
-    analytics.posture >= 80
-      ? "good"
-      : analytics.posture >= 60
-      ? "warn"
-      : "bad";
+  const postureTone = analytics.posture >= 80 ? "good" : analytics.posture >= 60 ? "warn" : "bad";
 
-  /* ── AUDIT HELPER ── */
   const addAudit = useCallback(
     async (action, details, user = session) => {
       await db.add("auditLogs", {
@@ -2952,38 +1639,39 @@ export default function App() {
     [session]
   );
 
-  /* ── ENROLL CAPTURE ── */
   const captureEnrollmentFrame = () => {
     if (enrollCaptures.length >= 3) return;
     const camera = enrollCameraRef.current;
+
     if (!camera?.isFaceDetected()) {
       showToast("No face detected. Position your face inside the guide.");
       return;
     }
+
     const frame = camera.captureFrame();
     if (!frame) {
       showToast("Camera is not ready.");
       return;
     }
-    setEnrollCaptures((current) => [...current, frame]);
+
+    setEnrollCaptures((cur) => [...cur, frame]);
     sfx.success();
   };
 
-  /* ── COMPLETE ENROLLMENT ── */
   const completeEnrollment = async () => {
     if (!enrollForm.name.trim() || !enrollConsent || enrollCaptures.length !== 3) {
-      showToast(
-        "Complete consent, staff details and all three biometric captures."
-      );
+      showToast("Complete consent, staff details and all three biometric captures.");
       return;
     }
+
     const suppliedId = enrollForm.staffId.trim();
-    const staffId =
-      suppliedId || `SS-${Math.floor(1000 + Math.random() * 9000)}`;
+    const staffId = suppliedId || `SS-${Math.floor(1000 + Math.random() * 9000)}`;
+
     if (users.some((u) => u.staffId === staffId)) {
       showToast("That Staff ID is already enrolled.");
       return;
     }
+
     const user = normalizeUser({
       ...enrollForm,
       staffId,
@@ -2991,6 +1679,7 @@ export default function App() {
       captures: enrollCaptures,
       enrolledAt: Date.now(),
     });
+
     try {
       await db.put("users", user);
       await addAudit(
@@ -3002,15 +1691,12 @@ export default function App() {
       enrollCameraRef.current?.stop();
       setEnrollStep(4);
       sfx.success();
-    } catch (error) {
-      console.error(error);
-      showToast(
-        "Enrollment failed. Please check the database status and retry."
-      );
+    } catch (e) {
+      console.error(e);
+      showToast("Enrollment failed. Please check the database status and retry.");
     }
   };
 
-  /* ── BEGIN AUTH ── */
   const beginAuthentication = () => {
     if (!selectedAuthUser) {
       showToast("Select an enrolled Staff ID before starting the scan.");
@@ -3020,6 +1706,12 @@ export default function App() {
       showToast("Biometric engine is not ready yet.");
       return;
     }
+
+    if (processingTimerRef.current) {
+      clearTimeout(processingTimerRef.current);
+      processingTimerRef.current = null;
+    }
+
     setAuthError("");
     setAuthRisk(null);
     setAuthOtp("");
@@ -3027,18 +1719,23 @@ export default function App() {
     setAuthFaceDetected(false);
     setAuthPhase("camera_starting");
     sfx.whoosh();
+
+    // EXTRA reliability: force camera start immediately
+    authCameraRef.current?.start();
   };
 
-  /* ── PROCESS AUTH ── */
   const processAuthentication = useCallback(async () => {
     if (!selectedAuthUser || authPhase !== "processing") return;
+
     const risk = calculateRisk({
       enrolled: true,
       anomalous: authAnomalous,
       failed: authFailCount,
       scenario: authScenario,
     });
+
     const tier = riskTier(risk.score);
+
     const event = {
       userId: selectedAuthUser.staffId,
       staffId: selectedAuthUser.staffId,
@@ -3047,23 +1744,13 @@ export default function App() {
       department: selectedAuthUser.department,
       riskScore: risk.score,
       riskLevel: tier.key,
-      outcome:
-        tier.key === "low"
-          ? "Granted"
-          : tier.key === "med"
-          ? "Step-up"
-          : "Denied",
-      device: authAnomalous
-        ? "Unknown Device"
-        : "Hospital Workstation #A12",
-      location: authAnomalous
-        ? "External Network"
-        : "Colombo · Core LAN",
-      factors: risk.factors
-        .filter((factor) => factor.value > 10)
-        .map((factor) => factor.desc),
+      outcome: tier.key === "low" ? "Granted" : tier.key === "med" ? "Step-up" : "Denied",
+      device: authAnomalous ? "Unknown Device" : "Hospital Workstation #A12",
+      location: authAnomalous ? "External Network" : "Colombo · Core LAN",
+      factors: risk.factors.filter((f) => f.value > 10).map((f) => f.desc),
       timestamp: Date.now(),
     };
+
     try {
       const eventId = await db.add("authenticationEvents", event);
       await addAudit(
@@ -3071,6 +1758,7 @@ export default function App() {
         `${event.outcome} · Risk ${risk.score}/100 · ${selectedAuthUser.staffId}`,
         selectedAuthUser
       );
+
       if (tier.key === "high") {
         const incidentId = await db.add("incidents", {
           eventId,
@@ -3086,6 +1774,7 @@ export default function App() {
           status: "New",
           timestamp: Date.now(),
         });
+
         await db.add("alerts", {
           eventId,
           incidentId,
@@ -3097,21 +1786,21 @@ export default function App() {
           read: false,
           timestamp: Date.now(),
         });
-        setAuthFailCount((count) => count + 1);
+
+        setAuthFailCount((c) => c + 1);
       } else {
         setAuthFailCount(0);
       }
+
       await refreshData();
       setAuthRisk(risk);
       setAuthScoreAnim(0);
       setAuthPhase("result");
       authCameraRef.current?.stop();
       tier.key === "high" ? sfx.deny() : sfx.success();
-    } catch (error) {
-      console.error(error);
-      setAuthError(
-        "Authentication could not be completed because the security database failed."
-      );
+    } catch (e) {
+      console.error(e);
+      setAuthError("Authentication could not be completed because the security database failed.");
       setAuthPhase("idle");
       authCameraRef.current?.stop();
     }
@@ -3128,16 +1817,12 @@ export default function App() {
 
   useEffect(() => {
     if (authPhase !== "processing") return undefined;
-    processingTimerRef.current = setTimeout(
-      () => processAuthentication(),
-      1400
-    );
+    processingTimerRef.current = setTimeout(() => processAuthentication(), 1400);
     return () => {
       if (processingTimerRef.current) clearTimeout(processingTimerRef.current);
     };
   }, [authPhase, processAuthentication]);
 
-  /* ── SCORE ANIMATION ── */
   useEffect(() => {
     if (!authRisk || authPhase !== "result") return undefined;
     let value = 0;
@@ -3152,12 +1837,11 @@ export default function App() {
     return () => clearInterval(timer);
   }, [authPhase, authRisk]);
 
-  /* ── CAMERA STATE HANDLER ── */
   const handleAuthCameraState = useCallback(
-    (state) => {
+    (camState) => {
       if (
         authPhase === "camera_starting" &&
-        [CameraStates.READY, CameraStates.DETECTING].includes(state)
+        [CameraStates.READY, CameraStates.DETECTING].includes(camState)
       ) {
         setAuthPhase("camera_ready");
       }
@@ -3165,28 +1849,26 @@ export default function App() {
     [authPhase]
   );
 
-  /* ── FACE DETECTED HANDLER ── */
   const handleAuthFace = useCallback(
     (detected) => {
-      setAuthFaceDetected(detected);
-      if (
-        detected &&
-        (authPhase === "camera_starting" || authPhase === "camera_ready")
-      ) {
+      setAuthFaceDetected((prev) => (prev === detected ? prev : detected));
+
+      if (!detected) return;
+
+      if (authPhase === "camera_starting" || authPhase === "camera_ready") {
         setAuthPhase("biometric_scanning");
+
+        if (processingTimerRef.current) clearTimeout(processingTimerRef.current);
+
         processingTimerRef.current = setTimeout(() => {
-          if (authCameraRef.current?.isFaceDetected()) {
-            setAuthPhase("processing");
-          } else {
-            setAuthPhase("camera_ready");
-          }
+          if (authCameraRef.current?.isFaceDetected()) setAuthPhase("processing");
+          else setAuthPhase("camera_ready");
         }, 1400);
       }
     },
     [authPhase]
   );
 
-  /* ── VERIFY OTP ── */
   const verifyOtp = async () => {
     if (authOtp !== "123456") {
       sfx.deny();
@@ -3199,52 +1881,38 @@ export default function App() {
       return;
     }
     if (!selectedAuthUser) return;
-    await addAudit(
-      "OTP_VERIFICATION_SUCCESS",
-      "Step-up OTP verification successful.",
-      selectedAuthUser
-    );
+    await addAudit("OTP_VERIFICATION_SUCCESS", "Step-up OTP verification successful.", selectedAuthUser);
     setSession(selectedAuthUser);
     navigate("dashboard");
   };
 
-  /* ── LOGOUT ── */
   const logout = async () => {
     await addAudit("LOGOUT", "User logged out.");
     setSession(null);
     navigate("landing");
   };
 
-  /* ── INCIDENT STATUS ── */
   const updateIncidentStatus = async (incidentId, status) => {
     try {
-      await db.update("incidents", incidentId, {
-        status,
-        updatedAt: Date.now(),
-      });
-      await addAudit(
-        "INCIDENT_STATUS_UPDATE",
-        `Incident ${incidentId} changed to ${status}.`
-      );
+      await db.update("incidents", incidentId, { status, updatedAt: Date.now() });
+      await addAudit("INCIDENT_STATUS_UPDATE", `Incident ${incidentId} changed to ${status}.`);
       await refreshData();
       showToast("Incident status updated.");
-    } catch (error) {
-      console.error(error);
+    } catch (e) {
+      console.error(e);
       showToast("Incident update failed.");
     }
   };
 
-  /* ── MARK ALERT READ ── */
   const markAlertRead = async (alertId) => {
     try {
       await db.update("alerts", alertId, { read: true });
       await refreshData();
-    } catch (error) {
-      console.error(error);
+    } catch (e) {
+      console.error(e);
     }
   };
 
-  /* ── EXPORT REPORT ── */
   const exportSecurityReport = () => {
     const lines = [
       "SUWA SETHA HOSPITAL — SECURITY INTELLIGENCE REPORT",
@@ -3264,16 +1932,15 @@ export default function App() {
       "",
       "AI-ASSISTED SECURITY INSIGHTS",
       ...aiInsights.map(
-        (insight) =>
-          `[${insight.severity.toUpperCase()}] ${insight.title}\nEvidence: ${insight.evidence}\nRecommendation: ${insight.recommendation}`
+        (i) =>
+          `[${i.severity.toUpperCase()}] ${i.title}\nEvidence: ${i.evidence}\nRecommendation: ${i.recommendation}`
       ),
       "",
       "PROTOTYPE DISCLAIMER",
       "Biometric identity matching is represented as a prototype concept. Production deployment would require secure biometric templates, encryption, retention governance, DPIA review, access governance and independent security testing.",
     ];
-    const blob = new Blob([lines.join("\n")], {
-      type: "text/plain;charset=utf-8",
-    });
+
+    const blob = new Blob([lines.join("\n")], { type: "text/plain;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
@@ -3283,7 +1950,6 @@ export default function App() {
     showToast("Security report exported.");
   };
 
-  /* ── DASHBOARD TAB NAV ── */
   const goDashboard = (tab) => {
     const allowed = accessibleNavItems.some((section) =>
       section.items.some((item) => item.id === tab)
@@ -3297,12 +1963,8 @@ export default function App() {
     setMobileDashboardMenu(false);
   };
 
-  /* ─────────────────────────────────────────────
-     SHELL WRAPPER
-  ───────────────────────────────────────────── */
   const commonShell = (content) => (
     <div className="app-shell">
-      <StyleInjector />
       <Atmosphere />
       {content}
       <AnimatePresence>
@@ -3320,9 +1982,6 @@ export default function App() {
     </div>
   );
 
-  /* ─────────────────────────────────────────────
-     PUBLIC NAV
-  ───────────────────────────────────────────── */
   function PublicNav() {
     return (
       <header className="public-nav">
@@ -3335,6 +1994,7 @@ export default function App() {
             <small>HEALTHCARE SECURITY INTELLIGENCE</small>
           </span>
         </button>
+
         <nav className="public-links">
           {publicNav.map((item) => (
             <button
@@ -3346,19 +2006,17 @@ export default function App() {
             </button>
           ))}
         </nav>
+
         <div className="public-actions">
-          <span className="clock">{clock}</span>
-          <MangaButton
-            variant="ghost"
-            icon={LogIn}
-            onClick={() => navigate("login")}
-          >
+          <LiveClock />
+          <MangaButton variant="ghost" icon={LogIn} onClick={() => navigate("login")}>
             Login
           </MangaButton>
           <MangaButton icon={UserPlus} onClick={() => navigate("enroll")}>
             Enrol
           </MangaButton>
         </div>
+
         <button
           className="mobile-menu-btn"
           onClick={() => setMobileMenuOpen((v) => !v)}
@@ -3366,6 +2024,7 @@ export default function App() {
         >
           <Menu />
         </button>
+
         <AnimatePresence>
           {mobileMenuOpen && (
             <motion.div
@@ -3380,15 +2039,10 @@ export default function App() {
                 </button>
               ))}
               <div className="mobile-menu-actions">
-                <MangaButton
-                  variant="ghost"
-                  onClick={() => navigate("login")}
-                >
+                <MangaButton variant="ghost" onClick={() => navigate("login")}>
                   Login
                 </MangaButton>
-                <MangaButton onClick={() => navigate("enroll")}>
-                  Enrol
-                </MangaButton>
+                <MangaButton onClick={() => navigate("enroll")}>Enrol</MangaButton>
               </div>
             </motion.div>
           )}
@@ -3397,18 +2051,12 @@ export default function App() {
     );
   }
 
-  /* ─────────────────────────────────────────────
-     DASHBOARD SHELL
-  ───────────────────────────────────────────── */
   function AuthShell() {
     const meta = pageMeta[dashboardTab] || pageMeta.overview;
+
     return (
       <div className="dashboard-shell">
-        <aside
-          className={`dashboard-sidebar ${
-            mobileDashboardMenu ? "mobile-open" : ""
-          }`}
-        >
+        <aside className={`dashboard-sidebar ${mobileDashboardMenu ? "mobile-open" : ""}`}>
           <div className="sidebar-top">
             <div className="sidebar-brand">
               <span className="brand-mark">
@@ -3419,20 +2067,14 @@ export default function App() {
                 <small>SECURE HEALTHCARE</small>
               </span>
             </div>
-            <button
-              className="sidebar-close mobile-only"
-              onClick={() => setMobileDashboardMenu(false)}
-            >
+            <button className="sidebar-close mobile-only" onClick={() => setMobileDashboardMenu(false)}>
               <X size={20} />
             </button>
           </div>
+
           <div className="sidebar-user">
             <div className="avatar">
-              {session?.name
-                ?.split(" ")
-                .map((n) => n[0])
-                .join("")
-                .slice(0, 2)}
+              {session?.name?.split(" ").map((n) => n[0]).join("").slice(0, 2)}
             </div>
             <div>
               <strong>{session?.name}</strong>
@@ -3441,6 +2083,7 @@ export default function App() {
               </small>
             </div>
           </div>
+
           <nav className="dashboard-nav">
             {accessibleNavItems.map((section) => (
               <div key={section.section} className="nav-group">
@@ -3454,34 +2097,29 @@ export default function App() {
                     <item.icon size={16} />
                     {item.label}
                     {item.id === "alerts" && analytics.unreadAlerts > 0 && (
-                      <span className="nav-badge">
-                        {analytics.unreadAlerts}
-                      </span>
+                      <span className="nav-badge">{analytics.unreadAlerts}</span>
                     )}
                   </button>
                 ))}
               </div>
             ))}
           </nav>
+
           <div className="sidebar-bottom">
             <MangaButton variant="ghost" icon={LogOut} onClick={logout}>
               Logout
             </MangaButton>
           </div>
         </aside>
+
         {mobileDashboardMenu && (
-          <div
-            className="drawer-overlay mobile-only"
-            onClick={() => setMobileDashboardMenu(false)}
-          />
+          <div className="drawer-overlay mobile-only" onClick={() => setMobileDashboardMenu(false)} />
         )}
+
         <main className="dashboard-main">
           <header className="dashboard-topbar">
             <div className="topbar-left">
-              <button
-                className="mobile-menu-btn mobile-only"
-                onClick={() => setMobileDashboardMenu(true)}
-              >
+              <button className="mobile-menu-btn mobile-only" onClick={() => setMobileDashboardMenu(true)}>
                 <Menu />
               </button>
               <div>
@@ -3490,56 +2128,49 @@ export default function App() {
               </div>
             </div>
             <div className="topbar-right">
-              <span className={`status-pill status-${postureTone}`}>
-                POSTURE {analytics.posture}/100
-              </span>
-              <span className="clock">{clock}</span>
+              <span className={`status-pill status-${postureTone}`}>POSTURE {analytics.posture}/100</span>
+              <LiveClock />
             </div>
           </header>
+
           <div className="dashboard-content">{renderDashboardTab()}</div>
         </main>
       </div>
     );
   }
 
-  /* ─────────────────────────────────────────────
-     DASHBOARD TAB RENDERER
-  ───────────────────────────────────────────── */
   function renderDashboardTab() {
     switch (dashboardTab) {
       case "records":
-        return <PatientRecords />;
+        return PatientRecords();
       case "analytics":
-        return <SecurityAnalytics />;
+        return SecurityAnalytics();
       case "log":
-        return <AccessLog />;
+        return AccessLog();
       case "insights":
-        return <AIInsights />;
+        return AIInsights();
       case "timeline":
-        return <ThreatTimeline />;
+        return ThreatTimeline();
       case "incidents":
-        return <IncidentCentre />;
+        return IncidentCentre();
       case "alerts":
-        return <SecurityAlerts />;
+        return SecurityAlerts();
       case "explorer":
-        return <DataExplorer />;
+        return DataExplorer();
       case "staff":
-        return <StaffDirectory />;
+        return StaffDirectory();
       case "audit":
-        return <AuditLog />;
+        return AuditLog();
       case "health":
-        return <SystemHealth />;
+        return SystemHealth();
       case "settings":
-        return <SecuritySettings />;
+        return SecuritySettings();
       case "overview":
       default:
-        return <DashboardOverview />;
+        return DashboardOverview();
     }
   }
 
-  /* ─────────────────────────────────────────────
-     DASHBOARD TABS
-  ───────────────────────────────────────────── */
   function DashboardOverview() {
     return (
       <div className="page-stack">
@@ -3548,8 +2179,8 @@ export default function App() {
             <div className="eyebrow">SECURE HEALTHCARE COMMAND CENTRE</div>
             <h2>AI-ASSISTED BIOMETRIC SECURITY</h2>
             <p>
-              Monitor access, investigate risk and keep sensitive clinical
-              systems protected with a unified security view.
+              Monitor access, investigate risk and keep sensitive clinical systems protected with a unified security
+              view.
             </p>
           </div>
           <div className="hero-score">
@@ -3558,41 +2189,22 @@ export default function App() {
             <small>/ 100</small>
           </div>
         </div>
+
         <div className="stats-grid">
-          <StatCard
-            label="Authentication Attempts"
-            value={analytics.total}
-            icon={Activity}
-          />
-          <StatCard
-            label="Success Rate"
-            value={`${analytics.successRate}%`}
-            icon={ShieldCheck}
-          />
-          <StatCard
-            label="Average Risk"
-            value={`${analytics.avgRisk}/100`}
-            icon={TrendingUp}
-          />
-          <StatCard
-            label="Open Incidents"
-            value={analytics.openIncidents}
-            icon={AlertOctagon}
-          />
+          <StatCard label="Authentication Attempts" value={analytics.total} icon={Activity} />
+          <StatCard label="Success Rate" value={`${analytics.successRate}%`} icon={ShieldCheck} />
+          <StatCard label="Average Risk" value={`${analytics.avgRisk}/100`} icon={TrendingUp} />
+          <StatCard label="Open Incidents" value={analytics.openIncidents} icon={AlertOctagon} />
         </div>
+
         <div className="two-col">
           <MangaPanel>
-            <SectionHeader
-              eyebrow="LIVE SIGNALS"
-              title="Recent Authentication Activity"
-            />
+            <SectionHeader eyebrow="LIVE SIGNALS" title="Recent Authentication Activity" />
             <EventTable events={authEvents.slice(0, 6)} compact />
           </MangaPanel>
+
           <MangaPanel>
-            <SectionHeader
-              eyebrow="INTELLIGENCE"
-              title="Current Security Insights"
-            />
+            <SectionHeader eyebrow="INTELLIGENCE" title="Current Security Insights" />
             <div className="stack-list">
               {aiInsights.slice(0, 3).map((insight) => (
                 <InsightCard key={insight.title} insight={insight} />
@@ -3612,44 +2224,31 @@ export default function App() {
           title="Patient Records"
           description="Fictional clinical data used to demonstrate secure role-based hospital access."
         />
+
         <div className="patient-grid">
-          {PATIENTS.map((patient) => (
-            <button
-              key={patient.id}
-              className="patient-card"
-              onClick={() => setSelectedPatient(patient)}
-            >
+          {PATIENTS.map((p) => (
+            <button key={p.id} className="patient-card" onClick={() => setSelectedPatient(p)}>
               <div className="patient-card-top">
-                <span>{patient.id}</span>
-                <StatusPill
-                  tone={
-                    patient.status === "Critical"
-                      ? "bad"
-                      : patient.status === "Stable"
-                      ? "good"
-                      : "neutral"
-                  }
-                >
-                  {patient.status}
+                <span>{p.id}</span>
+                <StatusPill tone={p.status === "Critical" ? "bad" : p.status === "Stable" ? "good" : "neutral"}>
+                  {p.status}
                 </StatusPill>
               </div>
-              <strong>{patient.name}</strong>
+              <strong>{p.name}</strong>
               <small>
-                {patient.ward} · {patient.doctor}
+                {p.ward} · {p.doctor}
               </small>
               <div className="patient-vitals">
-                <span>HR {patient.hr}</span>
-                <span>BP {patient.bp}</span>
-                <span>SpO₂ {patient.spo2}%</span>
+                <span>HR {p.hr}</span>
+                <span>BP {p.bp}</span>
+                <span>SpO₂ {p.spo2}%</span>
               </div>
             </button>
           ))}
         </div>
+
         {selectedPatient && (
-          <Modal
-            title={selectedPatient.name}
-            onClose={() => setSelectedPatient(null)}
-          >
+          <Modal title={selectedPatient.name} onClose={() => setSelectedPatient(null)}>
             <div className="detail-grid">
               <div>
                 <span>Patient ID</span>
@@ -3676,14 +2275,11 @@ export default function App() {
   }
 
   function SecurityAnalytics() {
-    const maxBar = Math.max(
-      1,
-      ...authEvents.slice(0, 12).map((event) => event.riskScore)
-    );
-    const departmentCounts = DEPARTMENTS.map((department) => ({
-      department,
-      count: authEvents.filter((e) => e.department === department).length,
-    })).filter((item) => item.count > 0);
+    const maxBar = Math.max(1, ...authEvents.slice(0, 12).map((e) => e.riskScore));
+    const departmentCounts = DEPARTMENTS.map((d) => ({
+      department: d,
+      count: authEvents.filter((e) => e.department === d).length,
+    })).filter((x) => x.count > 0);
 
     return (
       <div className="page-stack">
@@ -3692,29 +2288,19 @@ export default function App() {
           title="Security Analytics"
           description="Persistent authentication data transformed into operational security intelligence."
           action={
-            <MangaButton
-              variant="secondary"
-              icon={Download}
-              onClick={exportSecurityReport}
-            >
+            <MangaButton variant="secondary" icon={Download} onClick={exportSecurityReport}>
               Export Report
             </MangaButton>
           }
         />
+
         <div className="stats-grid">
           <StatCard label="Attempts" value={analytics.total} icon={Activity} />
-          <StatCard
-            label="Granted"
-            value={analytics.granted}
-            icon={ShieldCheck}
-          />
-          <StatCard
-            label="Step-up"
-            value={analytics.stepUp}
-            icon={ShieldAlert}
-          />
+          <StatCard label="Granted" value={analytics.granted} icon={ShieldCheck} />
+          <StatCard label="Step-up" value={analytics.stepUp} icon={ShieldAlert} />
           <StatCard label="Denied" value={analytics.denied} icon={ShieldX} />
         </div>
+
         <div className="two-col">
           <MangaPanel>
             <SectionHeader eyebrow="RISK TREND" title="Recent Risk Scores" />
@@ -3722,42 +2308,35 @@ export default function App() {
               {authEvents
                 .slice(0, 12)
                 .reverse()
-                .map((event) => (
-                  <div className="bar-item" key={event.id}>
+                .map((e) => (
+                  <div className="bar-item" key={e.id}>
                     <div className="bar-label">
-                      <span>{event.userName}</span>
-                      <strong>{event.riskScore}</strong>
+                      <span>{e.userName}</span>
+                      <strong>{e.riskScore}</strong>
                     </div>
-                    <ProgressBar
-                      value={(event.riskScore / maxBar) * 100}
-                    />
+                    <ProgressBar value={(e.riskScore / maxBar) * 100} />
                   </div>
                 ))}
             </div>
           </MangaPanel>
+
           <MangaPanel>
-            <SectionHeader
-              eyebrow="DEPARTMENT ACTIVITY"
-              title="Security Events by Department"
-            />
+            <SectionHeader eyebrow="DEPARTMENT ACTIVITY" title="Security Events by Department" />
             <div className="bar-chart">
-              {departmentCounts.map((item) => (
-                <div className="bar-item" key={item.department}>
+              {departmentCounts.map((x) => (
+                <div className="bar-item" key={x.department}>
                   <div className="bar-label">
-                    <span>{item.department}</span>
-                    <strong>{item.count}</strong>
+                    <span>{x.department}</span>
+                    <strong>{x.count}</strong>
                   </div>
-                  <ProgressBar
-                    value={(item.count / Math.max(1, analytics.total)) * 100}
-                  />
+                  <ProgressBar value={(x.count / Math.max(1, analytics.total)) * 100} />
                 </div>
               ))}
-              {departmentCounts.length === 0 && (
-                <EmptyState text="No authentication data yet." />
-              )}
+              {departmentCounts.length === 0 && <EmptyState text="No authentication data yet." />}
             </div>
           </MangaPanel>
         </div>
+
         <MangaPanel>
           <SectionHeader
             eyebrow="SECURITY POSTURE"
@@ -3794,9 +2373,7 @@ export default function App() {
   }
 
   function AccessLog() {
-    const mine = authEvents.filter(
-      (event) => event.staffId === session?.staffId
-    );
+    const mine = authEvents.filter((e) => e.staffId === session?.staffId);
     return (
       <div className="page-stack">
         <SectionHeader
@@ -3824,12 +2401,8 @@ export default function App() {
           description="Evidence-based prototype intelligence derived from persisted security events."
         />
         <div className="stack-list">
-          {aiInsights.map((insight) => (
-            <InsightCard
-              key={`${insight.title}-${insight.severity}`}
-              insight={insight}
-              large
-            />
+          {aiInsights.map((i) => (
+            <InsightCard key={`${i.title}-${i.severity}`} insight={i} large />
           ))}
         </div>
       </div>
@@ -3837,9 +2410,7 @@ export default function App() {
   }
 
   function ThreatTimeline() {
-    const items = [...authEvents]
-      .sort((a, b) => b.timestamp - a.timestamp)
-      .slice(0, 15);
+    const items = [...authEvents].sort((a, b) => b.timestamp - a.timestamp).slice(0, 15);
     return (
       <div className="page-stack">
         <SectionHeader
@@ -3849,20 +2420,19 @@ export default function App() {
         />
         {items.length ? (
           <div className="timeline">
-            {items.map((event) => (
-              <div className="timeline-item" key={event.id}>
+            {items.map((e) => (
+              <div className="timeline-item" key={e.id}>
                 <div className="timeline-dot" />
                 <div className="timeline-card">
                   <div className="timeline-top">
-                    <strong>{event.outcome}</strong>
-                    <span>{formatDate(event.timestamp)}</span>
+                    <strong>{e.outcome}</strong>
+                    <span>{formatDate(e.timestamp)}</span>
                   </div>
                   <div>
-                    {event.userName} · {event.staffId}
+                    {e.userName} · {e.staffId}
                   </div>
                   <small>
-                    Risk {event.riskScore}/100 · {event.device} ·{" "}
-                    {event.location}
+                    Risk {e.riskScore}/100 · {e.device} · {e.location}
                   </small>
                 </div>
               </div>
@@ -3885,51 +2455,43 @@ export default function App() {
         />
         {incidents.length ? (
           <div className="incident-list">
-            {incidents.map((incident) => (
-              <MangaPanel key={incident.id}>
+            {incidents.map((i) => (
+              <MangaPanel key={i.id}>
                 <div className="incident-top">
                   <div>
-                    <div className="eyebrow">INCIDENT #{incident.id}</div>
+                    <div className="eyebrow">INCIDENT #{i.id}</div>
                     <h3>
-                      {incident.userName} · {incident.staffId}
+                      {i.userName} · {i.staffId}
                     </h3>
                   </div>
-                  <StatusPill
-                    tone={
-                      incident.status === "Resolved" ? "good" : "bad"
-                    }
-                  >
-                    {incident.status}
-                  </StatusPill>
+                  <StatusPill tone={i.status === "Resolved" ? "good" : "bad"}>{i.status}</StatusPill>
                 </div>
+
                 <div className="detail-grid">
                   <div>
                     <span>Risk</span>
-                    <strong>{incident.riskScore}/100</strong>
+                    <strong>{i.riskScore}/100</strong>
                   </div>
                   <div>
                     <span>Department</span>
-                    <strong>{incident.department}</strong>
+                    <strong>{i.department}</strong>
                   </div>
                   <div>
                     <span>Device</span>
-                    <strong>{incident.device}</strong>
+                    <strong>{i.device}</strong>
                   </div>
                   <div>
                     <span>Created</span>
-                    <strong>{formatDate(incident.timestamp)}</strong>
+                    <strong>{formatDate(i.timestamp)}</strong>
                   </div>
                 </div>
+
                 <div className="button-row">
                   {["New", "Investigating", "Resolved"].map((status) => (
                     <MangaButton
                       key={status}
-                      variant={
-                        incident.status === status ? "primary" : "ghost"
-                      }
-                      onClick={() =>
-                        updateIncidentStatus(incident.id, status)
-                      }
+                      variant={i.status === status ? "primary" : "ghost"}
+                      onClick={() => updateIncidentStatus(i.id, status)}
                     >
                       {status}
                     </MangaButton>
@@ -3955,31 +2517,22 @@ export default function App() {
         />
         {alerts.length ? (
           <div className="stack-list">
-            {alerts.map((alert) => (
-              <MangaPanel
-                key={alert.id}
-                className={alert.read ? "alert-read" : ""}
-              >
+            {alerts.map((a) => (
+              <MangaPanel key={a.id} className={a.read ? "alert-read" : ""}>
                 <div className="incident-top">
                   <div>
-                    <div className="eyebrow">{alert.type}</div>
-                    <h3>{alert.message}</h3>
+                    <div className="eyebrow">{a.type}</div>
+                    <h3>{a.message}</h3>
                     <small>
-                      {formatDate(alert.timestamp)} · {alert.userName} ·{" "}
-                      {alert.userId}
+                      {formatDate(a.timestamp)} · {a.userName} · {a.userId}
                     </small>
                   </div>
-                  <StatusPill
-                    tone={alert.severity === "high" ? "bad" : "warn"}
-                  >
-                    {alert.severity.toUpperCase()}
+                  <StatusPill tone={a.severity === "high" ? "bad" : "warn"}>
+                    {String(a.severity || "").toUpperCase()}
                   </StatusPill>
                 </div>
-                {!alert.read && (
-                  <MangaButton
-                    variant="ghost"
-                    onClick={() => markAlertRead(alert.id)}
-                  >
+                {!a.read && (
+                  <MangaButton variant="ghost" onClick={() => markAlertRead(a.id)}>
                     Mark Read
                   </MangaButton>
                 )}
@@ -4049,22 +2602,18 @@ export default function App() {
           description="Security-oriented staff overview based on enrolled identities."
         />
         <div className="patient-grid">
-          {users.map((user) => {
-            const mine = authEvents.filter((e) => e.staffId === user.staffId);
-            const avg = mine.length
-              ? Math.round(
-                  mine.reduce((s, e) => s + e.riskScore, 0) / mine.length
-                )
-              : 0;
+          {users.map((u) => {
+            const mine = authEvents.filter((e) => e.staffId === u.staffId);
+            const avg = mine.length ? Math.round(mine.reduce((s, e) => s + e.riskScore, 0) / mine.length) : 0;
             return (
-              <MangaPanel key={user.staffId}>
+              <MangaPanel key={u.staffId}>
                 <div className="patient-card-top">
-                  <span>{user.staffId}</span>
+                  <span>{u.staffId}</span>
                   <StatusPill tone="good">ENROLLED</StatusPill>
                 </div>
-                <h3>{user.name}</h3>
+                <h3>{u.name}</h3>
                 <p>
-                  {user.role} · {user.department}
+                  {u.role} · {u.department}
                 </p>
                 <div className="detail-grid">
                   <div>
@@ -4077,15 +2626,11 @@ export default function App() {
                   </div>
                   <div>
                     <span>High Risk</span>
-                    <strong>
-                      {mine.filter((e) => e.riskLevel === "high").length}
-                    </strong>
+                    <strong>{mine.filter((e) => e.riskLevel === "high").length}</strong>
                   </div>
                   <div>
                     <span>Last Access</span>
-                    <strong>
-                      {mine[0] ? formatDate(mine[0].timestamp) : "—"}
-                    </strong>
+                    <strong>{mine[0] ? formatDate(mine[0].timestamp) : "—"}</strong>
                   </div>
                 </div>
               </MangaPanel>
@@ -4107,21 +2652,19 @@ export default function App() {
         />
         <MangaPanel>
           <div className="audit-table">
-            {auditLogs.map((log) => (
-              <div className="audit-row" key={log.id}>
+            {auditLogs.map((l) => (
+              <div className="audit-row" key={l.id}>
                 <div>
-                  <strong>{log.action}</strong>
+                  <strong>{l.action}</strong>
                   <small>
-                    {log.userName} · {log.userId}
+                    {l.userName} · {l.userId}
                   </small>
                 </div>
-                <span>{formatDate(log.timestamp)}</span>
-                <p>{log.details}</p>
+                <span>{formatDate(l.timestamp)}</span>
+                <p>{l.details}</p>
               </div>
             ))}
-            {!auditLogs.length && (
-              <EmptyState text="No audit records yet." />
-            )}
+            {!auditLogs.length && <EmptyState text="No audit records yet." />}
           </div>
         </MangaPanel>
       </div>
@@ -4132,11 +2675,7 @@ export default function App() {
     const rows = [
       { label: "Security Database", state: dbState, icon: Database },
       { label: "Face Detection Model", state: faceModelState, icon: Eye },
-      {
-        label: "Authentication Engine",
-        state: "ready",
-        icon: Fingerprint,
-      },
+      { label: "Authentication Engine", state: "ready", icon: Fingerprint },
       { label: "Analytics Engine", state: "ready", icon: BarChart3 },
       { label: "Audit System", state: "ready", icon: FileBarChart },
     ];
@@ -4148,25 +2687,17 @@ export default function App() {
           description="Live status derived from the actual application subsystems."
         />
         <div className="health-grid">
-          {rows.map((row) => (
-            <MangaPanel key={row.label} className="health-row">
+          {rows.map((r) => (
+            <MangaPanel key={r.label} className="health-row">
               <div>
-                <row.icon size={19} />
+                <r.icon size={19} />
                 <div>
-                  <strong>{row.label}</strong>
-                  <small>{row.state.toUpperCase()}</small>
+                  <strong>{r.label}</strong>
+                  <small>{String(r.state).toUpperCase()}</small>
                 </div>
               </div>
-              <StatusPill
-                tone={
-                  row.state === "ready"
-                    ? "good"
-                    : row.state === "error"
-                    ? "bad"
-                    : "warn"
-                }
-              >
-                {row.state}
+              <StatusPill tone={r.state === "ready" ? "good" : r.state === "error" ? "bad" : "warn"}>
+                {r.state}
               </StatusPill>
             </MangaPanel>
           ))}
@@ -4203,8 +2734,7 @@ export default function App() {
               <div>
                 <strong>Security Guidance</strong>
                 <small>
-                  Never share credentials or bypass biometric controls in
-                  a production environment.
+                  Never share credentials or bypass biometric controls in a production environment.
                 </small>
               </div>
             </div>
@@ -4214,113 +2744,16 @@ export default function App() {
     );
   }
 
-  /* ─────────────────────────────────────────────
-     PUBLIC PAGES
-  ───────────────────────────────────────────── */
-  function LandingPage() {
-    return commonShell(
-      <>
-        <PublicNav />
-        <div className="landing">
-          <section className="landing-hero">
-            <div className="hero-copy">
-              <div className="eyebrow hero-eyebrow">
-                AI BIOMETRIC ACCESS CONTROL · SUWA SETHA
-              </div>
-              <h1>
-                SECURING
-                <br />
-                <span>HEALTHCARE</span>
-                <br />
-                OPERATIONS
-              </h1>
-              <p>
-                AI-assisted biometric cybersecurity prototype combining
-                real-time face detection, contextual risk assessment and
-                persistent security intelligence.
-              </p>
-              <div className="button-row">
-                <MangaButton
-                  icon={UserPlus}
-                  onClick={() => navigate("enroll")}
-                >
-                  Enrol Biometric
-                </MangaButton>
-                <MangaButton
-                  variant="secondary"
-                  icon={LogIn}
-                  onClick={() => navigate("login")}
-                >
-                  Secure Login
-                </MangaButton>
-              </div>
-            </div>
-            <div className="hero-scanner">
-              <div className="hero-circle">
-                <Fingerprint size={100} />
-                <span>
-                  SECURITY
-                  <br />
-                  INTELLIGENCE
-                </span>
-              </div>
-            </div>
-          </section>
-          <section className="public-section">
-            <SectionHeader
-              eyebrow="THE SYSTEM"
-              title="One connected security workflow"
-            />
-            <div className="architecture-grid">
-              <MangaPanel>
-                <span className="panel-number">01</span>
-                <h3>Biometric</h3>
-                <p>Real webcam + face presence.</p>
-              </MangaPanel>
-              <MangaPanel>
-                <span className="panel-number">02</span>
-                <h3>Risk</h3>
-                <p>Contextual AI-assisted score.</p>
-              </MangaPanel>
-              <MangaPanel>
-                <span className="panel-number">03</span>
-                <h3>Data</h3>
-                <p>Persistent security events.</p>
-              </MangaPanel>
-              <MangaPanel>
-                <span className="panel-number">04</span>
-                <h3>Response</h3>
-                <p>Insights, alerts and audit.</p>
-              </MangaPanel>
-            </div>
-          </section>
-        </div>
-      </>
-    );
-  }
-
   function ArchitecturePage() {
     const cards = [
       ["01", "BIOMETRIC", "Real webcam capture and face-presence detection."],
-      [
-        "02",
-        "AI RISK",
-        "Contextual scoring across device, network, time and failed attempts.",
-      ],
-      [
-        "03",
-        "SECURITY DATA",
-        "Persistent authentication events stored for analysis.",
-      ],
-      [
-        "04",
-        "RESPONSE",
-        "Alerts, incidents and auditability for administrator review.",
-      ],
+      ["02", "AI RISK", "Contextual scoring across device, network, time and failed attempts."],
+      ["03", "SECURITY DATA", "Persistent authentication events stored for analysis."],
+      ["04", "RESPONSE", "Alerts, incidents and auditability for administrator review."],
     ];
     return commonShell(
       <>
-        <PublicNav />
+        {PublicNav()}
         <div className="public-page">
           <SectionHeader
             eyebrow="SYSTEM ARCHITECTURE"
@@ -4343,45 +2776,18 @@ export default function App() {
 
   function CapabilitiesPage() {
     const capabilities = [
-      [
-        Fingerprint,
-        "Biometric Access",
-        "Real-time face presence detection with controlled webcam lifecycle.",
-      ],
-      [
-        ShieldAlert,
-        "Risk-Based Access",
-        "Contextual risk scoring determines trusted, step-up or denied outcomes.",
-      ],
-      [
-        Database,
-        "Security Database",
-        "IndexedDB persistence for users, authentication events, incidents, alerts and audit records.",
-      ],
-      [
-        BarChart3,
-        "Security Analytics",
-        "Historical security data becomes operational metrics and trends.",
-      ],
-      [
-        Sparkles,
-        "AI-Assisted Insights",
-        "Evidence-based prototype insights derived from stored security events.",
-      ],
-      [
-        Users,
-        "Role-Based Access",
-        "Different hospital staff roles receive appropriate system capabilities.",
-      ],
+      [Fingerprint, "Biometric Access", "Real-time face presence detection with controlled webcam lifecycle."],
+      [ShieldAlert, "Risk-Based Access", "Contextual risk scoring determines trusted, step-up or denied outcomes."],
+      [Database, "Security Database", "IndexedDB persistence for users, authentication events, incidents, alerts and audit records."],
+      [BarChart3, "Security Analytics", "Historical security data becomes operational metrics and trends."],
+      [Sparkles, "AI-Assisted Insights", "Evidence-based prototype insights derived from stored security events."],
+      [Users, "Role-Based Access", "Different hospital staff roles receive appropriate system capabilities."],
     ];
     return commonShell(
       <>
-        <PublicNav />
+        {PublicNav()}
         <div className="public-page">
-          <SectionHeader
-            eyebrow="PLATFORM CAPABILITIES"
-            title="What the Prototype Demonstrates"
-          />
+          <SectionHeader eyebrow="PLATFORM CAPABILITIES" title="What the Prototype Demonstrates" />
           <div className="capability-grid">
             {capabilities.map(([Icon, title, text]) => (
               <MangaPanel key={title} hover>
@@ -4417,7 +2823,7 @@ export default function App() {
     ];
     return commonShell(
       <>
-        <PublicNav />
+        {PublicNav()}
         <div className="public-page">
           <SectionHeader
             eyebrow="ETHICS & GOVERNANCE"
@@ -4439,35 +2845,15 @@ export default function App() {
 
   function IterationsPage() {
     const iterations = [
-      [
-        "V1",
-        "Basic biometric access concept",
-        "Initial concept explored biometric authentication for hospital system access.",
-      ],
-      [
-        "V2",
-        "Contextual risk scoring",
-        "Added device, network, time and failed-attempt factors instead of binary pass/fail access.",
-      ],
-      [
-        "V3",
-        "Consent and step-up",
-        "Added explicit biometric consent, OTP step-up and retry controls.",
-      ],
-      [
-        "V4",
-        "Persistent security data",
-        "Added IndexedDB persistence so analytics and incidents are backed by stored authentication events.",
-      ],
-      [
-        "V5",
-        "Navigation and usability",
-        "Unified navigation, role-aware views and a more coherent security command-centre experience.",
-      ],
+      ["V1", "Basic biometric access concept", "Initial concept explored biometric authentication for hospital system access."],
+      ["V2", "Contextual risk scoring", "Added device, network, time and failed-attempt factors instead of binary pass/fail access."],
+      ["V3", "Consent and step-up", "Added explicit biometric consent, OTP step-up and retry controls."],
+      ["V4", "Persistent security data", "Added IndexedDB persistence so analytics and incidents are backed by stored authentication events."],
+      ["V5", "Navigation and usability", "Unified navigation, role-aware views and a more coherent security command-centre experience."],
     ];
     return commonShell(
       <>
-        <PublicNav />
+        {PublicNav()}
         <div className="public-page">
           <SectionHeader
             eyebrow="ITERATION LOG"
@@ -4491,49 +2877,107 @@ export default function App() {
     );
   }
 
-  /* ─────────────────────────────────────────────
-     ENROLLMENT PAGE
-  ───────────────────────────────────────────── */
+  function LandingPage() {
+    return commonShell(
+      <>
+        {PublicNav()}
+        <div className="landing">
+          <section className="landing-hero">
+            <div className="hero-copy">
+              <div className="eyebrow hero-eyebrow">AI BIOMETRIC ACCESS CONTROL · SUWA SETHA</div>
+              <h1>
+                SECURING
+                <br />
+                <span>HEALTHCARE</span>
+                <br />
+                OPERATIONS
+              </h1>
+              <p>
+                AI-assisted biometric cybersecurity prototype combining real-time face detection, contextual risk
+                assessment and persistent security intelligence.
+              </p>
+              <div className="button-row">
+                <MangaButton icon={UserPlus} onClick={() => navigate("enroll")}>
+                  Enrol Biometric
+                </MangaButton>
+                <MangaButton variant="secondary" icon={LogIn} onClick={() => navigate("login")}>
+                  Secure Login
+                </MangaButton>
+              </div>
+            </div>
+            <div className="hero-scanner">
+              <div className="hero-circle">
+                <Fingerprint size={100} />
+                <span>
+                  SECURITY
+                  <br />
+                  INTELLIGENCE
+                </span>
+              </div>
+            </div>
+          </section>
+
+          <section className="public-section">
+            <SectionHeader eyebrow="THE SYSTEM" title="One connected security workflow" />
+            <div className="architecture-grid">
+              <MangaPanel>
+                <span className="panel-number">01</span>
+                <h3>Biometric</h3>
+                <p>Real webcam + face presence.</p>
+              </MangaPanel>
+              <MangaPanel>
+                <span className="panel-number">02</span>
+                <h3>Risk</h3>
+                <p>Contextual AI-assisted score.</p>
+              </MangaPanel>
+              <MangaPanel>
+                <span className="panel-number">03</span>
+                <h3>Data</h3>
+                <p>Persistent security events.</p>
+              </MangaPanel>
+              <MangaPanel>
+                <span className="panel-number">04</span>
+                <h3>Response</h3>
+                <p>Insights, alerts and audit.</p>
+              </MangaPanel>
+            </div>
+          </section>
+        </div>
+      </>
+    );
+  }
+
   function EnrollmentPage() {
     return commonShell(
       <>
-        <PublicNav />
+        {PublicNav()}
         <div className="public-page narrow">
           <SectionHeader
             eyebrow="BIOMETRIC ENROLMENT"
             title="Create a secure staff profile"
             description="Prototype biometric enrollment using three real camera captures."
           />
+
           <div className="progress-steps">
-            {["CONSENT", "DETAILS", "CAPTURE", "CONFIRM", "COMPLETE"].map(
-              (step, index) => (
-                <div
-                  key={step}
-                  className={enrollStep >= index ? "step active" : "step"}
-                >
-                  <span>{index + 1}</span>
-                  {step}
-                </div>
-              )
-            )}
+            {["CONSENT", "DETAILS", "CAPTURE", "CONFIRM", "COMPLETE"].map((step, i) => (
+              <div key={step} className={enrollStep >= i ? "step active" : "step"}>
+                <span>{i + 1}</span>
+                {step}
+              </div>
+            ))}
           </div>
+
           <AnimatePresence mode="wait">
             {enrollStep === 0 && (
-              <motion.div
-                key="consent"
-                initial={{ opacity: 0, y: 15 }}
-                animate={{ opacity: 1, y: 0 }}
-              >
+              <motion.div key="consent" initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }}>
                 <MangaPanel>
                   <div className="center-icon">
                     <Lock size={30} />
                   </div>
                   <h3>Biometric Consent</h3>
                   <p className="center-text">
-                    This prototype captures three facial reference frames for
-                    demonstration. Production systems would require secure
-                    biometric templates, retention rules, access governance
-                    and explicit privacy controls.
+                    This prototype captures three facial reference frames for demonstration. Production systems would
+                    require secure biometric templates, retention rules, access governance and explicit privacy controls.
                   </p>
                   <label className="consent-box">
                     <input
@@ -4541,74 +2985,50 @@ export default function App() {
                       checked={enrollConsent}
                       onChange={(e) => setEnrollConsent(e.target.checked)}
                     />
-                    <span>
-                      I understand and consent to prototype biometric
-                      capture.
-                    </span>
+                    <span>I understand and consent to prototype biometric capture.</span>
                   </label>
-                  <MangaButton
-                    disabled={!enrollConsent}
-                    icon={ChevronRight}
-                    onClick={() => setEnrollStep(1)}
-                  >
+                  <MangaButton disabled={!enrollConsent} icon={ChevronRight} onClick={() => setEnrollStep(1)}>
                     Continue
                   </MangaButton>
                 </MangaPanel>
               </motion.div>
             )}
+
             {enrollStep === 1 && (
-              <motion.div
-                key="details"
-                initial={{ opacity: 0, y: 15 }}
-                animate={{ opacity: 1, y: 0 }}
-              >
+              <motion.div key="details" initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }}>
                 <MangaPanel>
                   <h3>Staff Profile</h3>
                   <div className="form-grid">
                     <MangaInput
                       label="Full Name"
                       value={enrollForm.name}
-                      onChange={(e) =>
-                        setEnrollForm({ ...enrollForm, name: e.target.value })
-                      }
+                      onChange={(e) => setEnrollForm({ ...enrollForm, name: e.target.value })}
                       placeholder="Dr. Nimal Perera"
                     />
                     <MangaInput
                       label="Staff ID (Optional)"
                       value={enrollForm.staffId}
-                      onChange={(e) =>
-                        setEnrollForm({
-                          ...enrollForm,
-                          staffId: e.target.value,
-                        })
-                      }
+                      onChange={(e) => setEnrollForm({ ...enrollForm, staffId: e.target.value })}
                       placeholder="SS-1042"
                     />
                     <MangaSelect
                       label="Role"
                       value={enrollForm.role}
-                      onChange={(e) =>
-                        setEnrollForm({ ...enrollForm, role: e.target.value })
-                      }
+                      onChange={(e) => setEnrollForm({ ...enrollForm, role: e.target.value })}
                       options={ROLES}
                     />
                     <MangaSelect
                       label="Department"
                       value={enrollForm.department}
-                      onChange={(e) =>
-                        setEnrollForm({
-                          ...enrollForm,
-                          department: e.target.value,
-                        })
-                      }
+                      onChange={(e) => setEnrollForm({ ...enrollForm, department: e.target.value })}
                       options={DEPARTMENTS}
                     />
                   </div>
+
                   <MangaButton
                     icon={Camera}
                     onClick={() => {
-                      if (!enrollForm.name.trim())
-                        return showToast("Enter the staff name first.");
+                      if (!enrollForm.name.trim()) return showToast("Enter the staff name first.");
                       setEnrollStep(2);
                     }}
                   >
@@ -4617,35 +3037,37 @@ export default function App() {
                 </MangaPanel>
               </motion.div>
             )}
+
             {enrollStep === 2 && (
-              <motion.div
-                key="capture"
-                initial={{ opacity: 0, y: 15 }}
-                animate={{ opacity: 1, y: 0 }}
-              >
+              <motion.div key="capture" initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }}>
                 <MangaPanel>
                   <h3>Live Biometric Capture</h3>
                   <p>Three frames · real face-presence detection</p>
+
                   <BiometricCamera
                     ref={enrollCameraRef}
                     autoStart
                     showGuide
                     onError={showToast}
+                    // tuned defaults for less lag while still detecting reliably
+                    detectionMs={500}
+                    detectionMsWhenDetected={800}
+                    inputSize={192}
+                    scoreThreshold={0.45}
                   />
+
                   <div className="capture-strip">
-                    {[0, 1, 2].map((index) => (
-                      <div className="capture-box" key={index}>
-                        {enrollCaptures[index] ? (
-                          <img
-                            src={enrollCaptures[index]}
-                            alt={`Capture ${index + 1}`}
-                          />
+                    {[0, 1, 2].map((idx) => (
+                      <div className="capture-box" key={idx}>
+                        {enrollCaptures[idx] ? (
+                          <img src={enrollCaptures[idx]} alt={`Capture ${idx + 1}`} />
                         ) : (
-                          <span>{index + 1}</span>
+                          <span>{idx + 1}</span>
                         )}
                       </div>
                     ))}
                   </div>
+
                   <div className="button-row center">
                     <MangaButton
                       icon={Camera}
@@ -4654,11 +3076,9 @@ export default function App() {
                     >
                       Capture {Math.min(enrollCaptures.length + 1, 3)} / 3
                     </MangaButton>
+
                     {enrollCaptures.length === 3 && (
-                      <MangaButton
-                        variant="secondary"
-                        onClick={() => setEnrollStep(3)}
-                      >
+                      <MangaButton variant="secondary" onClick={() => setEnrollStep(3)}>
                         Continue
                       </MangaButton>
                     )}
@@ -4666,42 +3086,28 @@ export default function App() {
                 </MangaPanel>
               </motion.div>
             )}
+
             {enrollStep === 3 && (
-              <motion.div
-                key="confirm"
-                initial={{ opacity: 0, y: 15 }}
-                animate={{ opacity: 1, y: 0 }}
-              >
+              <motion.div key="confirm" initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }}>
                 <MangaPanel>
                   <h3>Confirm Enrollment</h3>
                   <p>
-                    {enrollForm.name} · {enrollForm.role} ·{" "}
-                    {enrollForm.department}
+                    {enrollForm.name} · {enrollForm.role} · {enrollForm.department}
                   </p>
                   <div className="capture-strip confirm-strip">
-                    {enrollCaptures.map((capture, index) => (
-                      <img
-                        key={index}
-                        src={capture}
-                        alt={`Capture ${index + 1}`}
-                      />
+                    {enrollCaptures.map((c, i) => (
+                      <img key={i} src={c} alt={`Capture ${i + 1}`} />
                     ))}
                   </div>
-                  <MangaButton
-                    icon={BadgeCheck}
-                    onClick={completeEnrollment}
-                  >
+                  <MangaButton icon={BadgeCheck} onClick={completeEnrollment}>
                     Complete Enrollment
                   </MangaButton>
                 </MangaPanel>
               </motion.div>
             )}
+
             {enrollStep === 4 && (
-              <motion.div
-                key="complete"
-                initial={{ opacity: 0, scale: 0.96 }}
-                animate={{ opacity: 1, scale: 1 }}
-              >
+              <motion.div key="complete" initial={{ opacity: 0, scale: 0.96 }} animate={{ opacity: 1, scale: 1 }}>
                 <MangaPanel>
                   <div className="success-screen">
                     <CheckCircle2 size={62} />
@@ -4710,13 +3116,10 @@ export default function App() {
                     <p>
                       Staff ID:{" "}
                       {enrollForm.staffId ||
-                        users.find((u) => u.name === enrollForm.name)
-                          ?.staffId ||
+                        users.find((u) => u.name === enrollForm.name)?.staffId ||
                         "Assigned"}
                     </p>
-                    <MangaButton onClick={() => navigate("login")}>
-                      Proceed to Secure Login
-                    </MangaButton>
+                    <MangaButton onClick={() => navigate("login")}>Proceed to Secure Login</MangaButton>
                   </div>
                 </MangaPanel>
               </motion.div>
@@ -4727,15 +3130,12 @@ export default function App() {
     );
   }
 
-  /* ─────────────────────────────────────────────
-     LOGIN PAGE
-  ───────────────────────────────────────────── */
   function LoginPage() {
     const tier = authRisk ? riskTier(authRisk.score) : null;
 
     return commonShell(
       <>
-        <PublicNav />
+        {PublicNav()}
         <div className="public-page narrow login-page">
           <SectionHeader
             eyebrow="SECURE ACCESS"
@@ -4747,10 +3147,7 @@ export default function App() {
             <MangaPanel>
               <EmptyState text="No staff profiles are enrolled yet. Complete biometric enrollment first." />
               <div className="center mt-16">
-                <MangaButton
-                  icon={UserPlus}
-                  onClick={() => navigate("enroll")}
-                >
+                <MangaButton icon={UserPlus} onClick={() => navigate("enroll")}>
                   Enrol Staff
                 </MangaButton>
               </div>
@@ -4767,24 +3164,19 @@ export default function App() {
                     setAuthRisk(null);
                     setAuthError("");
                   }}
-                  options={["", ...users.map((user) => user.staffId)]}
+                  options={["", ...users.map((u) => u.staffId)]}
                 />
+
                 {selectedAuthUser && (
                   <div className="selected-identity">
                     <div className="avatar">
-                      {selectedAuthUser.name
-                        .split(" ")
-                        .map((n) => n[0])
-                        .join("")
-                        .slice(0, 2)}
+                      {selectedAuthUser.name.split(" ").map((n) => n[0]).join("").slice(0, 2)}
                     </div>
                     <div>
                       <span>AUTHENTICATING</span>
                       <strong>{selectedAuthUser.name}</strong>
                       <small>
-                        {selectedAuthUser.staffId} ·{" "}
-                        {selectedAuthUser.role} ·{" "}
-                        {selectedAuthUser.department}
+                        {selectedAuthUser.staffId} · {selectedAuthUser.role} · {selectedAuthUser.department}
                       </small>
                     </div>
                   </div>
@@ -4796,16 +3188,16 @@ export default function App() {
                   {authPhase === "idle"
                     ? "READY FOR SECURE SCAN"
                     : authPhase === "camera_starting"
-                    ? "INITIALIZING CAMERA"
-                    : authPhase === "camera_ready"
-                    ? "SEARCHING FOR FACE"
-                    : authPhase === "biometric_scanning"
-                    ? "BIOMETRIC PROCESSING"
-                    : authPhase === "processing"
-                    ? "CALCULATING RISK"
-                    : authPhase === "result" && tier
-                    ? tier.label
-                    : "AUTHENTICATION"}
+                      ? "INITIALIZING CAMERA"
+                      : authPhase === "camera_ready"
+                        ? "SEARCHING FOR FACE"
+                        : authPhase === "biometric_scanning"
+                          ? "BIOMETRIC PROCESSING"
+                          : authPhase === "processing"
+                            ? "CALCULATING RISK"
+                            : authPhase === "result" && tier
+                              ? tier.label
+                              : "AUTHENTICATION"}
                 </div>
 
                 {authPhase !== "result" && selectedAuthUser && (
@@ -4815,10 +3207,15 @@ export default function App() {
                     showGuide
                     onFaceDetected={handleAuthFace}
                     onStateChange={handleAuthCameraState}
-                    onError={(message) => {
-                      setAuthError(message);
-                      showToast(message);
+                    onError={(m) => {
+                      setAuthError(m);
+                      showToast(m);
                     }}
+                    // tuned to reduce lag on login too:
+                    detectionMs={450}
+                    detectionMsWhenDetected={700}
+                    inputSize={192}
+                    scoreThreshold={0.45}
                   />
                 )}
 
@@ -4838,11 +3235,7 @@ export default function App() {
 
                 {authPhase === "idle" && (
                   <div className="center mt-16">
-                    <MangaButton
-                      disabled={!selectedAuthUser}
-                      icon={Fingerprint}
-                      onClick={beginAuthentication}
-                    >
+                    <MangaButton disabled={!selectedAuthUser} icon={Fingerprint} onClick={beginAuthentication}>
                       Start Secure Scan
                     </MangaButton>
                   </div>
@@ -4851,8 +3244,7 @@ export default function App() {
                 {authPhase !== "idle" && authPhase !== "result" && (
                   <div className="scan-meta">
                     <span>
-                      <Eye size={14} />{" "}
-                      FACE {authFaceDetected ? "DETECTED" : "SEARCHING"}
+                      <Eye size={14} /> FACE {authFaceDetected ? "DETECTED" : "SEARCHING"}
                     </span>
                     <span>
                       <Database size={14} /> DB {dbState.toUpperCase()}
@@ -4867,18 +3259,18 @@ export default function App() {
                       <strong>{authScoreAnim}</strong>
                       <small>/ 100</small>
                     </div>
+
                     <StatusPill tone={tier.tone}>{tier.label}</StatusPill>
+
                     <div className="risk-factors">
-                      {authRisk.factors.map((factor) => (
-                        <div key={factor.label} className="risk-factor">
+                      {authRisk.factors.map((f) => (
+                        <div key={f.label} className="risk-factor">
                           <div>
-                            <span>{factor.label}</span>
-                            <strong>+{factor.value}</strong>
+                            <span>{f.label}</span>
+                            <strong>+{f.value}</strong>
                           </div>
-                          <ProgressBar
-                            value={Math.min(100, factor.value * 2.5)}
-                          />
-                          <small>{factor.desc}</small>
+                          <ProgressBar value={Math.min(100, f.value * 2.5)} />
+                          <small>{f.desc}</small>
                         </div>
                       ))}
                     </div>
@@ -4887,11 +3279,7 @@ export default function App() {
                       <div className="otp-box">
                         <div className="eyebrow">STEP-UP VERIFICATION</div>
                         {!authOtpActive ? (
-                          <MangaButton
-                            variant="ghost"
-                            icon={Bell}
-                            onClick={() => setAuthOtpActive(true)}
-                          >
+                          <MangaButton variant="ghost" icon={Bell} onClick={() => setAuthOtpActive(true)}>
                             Send Demo OTP
                           </MangaButton>
                         ) : (
@@ -4900,18 +3288,12 @@ export default function App() {
                               <input
                                 value={authOtp}
                                 onChange={(e) =>
-                                  setAuthOtp(
-                                    e.target.value
-                                      .replace(/\D/g, "")
-                                      .slice(0, 6)
-                                  )
+                                  setAuthOtp(e.target.value.replace(/\D/g, "").slice(0, 6))
                                 }
                                 placeholder="123456"
                                 inputMode="numeric"
                               />
-                              <MangaButton onClick={verifyOtp}>
-                                Verify
-                              </MangaButton>
+                              <MangaButton onClick={verifyOtp}>Verify</MangaButton>
                             </div>
                             <small>Demo code: 123456</small>
                           </>
@@ -4932,9 +3314,7 @@ export default function App() {
                         <ShieldCheck size={34} />
                         <div>
                           <strong>ACCESS AUTHORIZED</strong>
-                          <span>
-                            Identity verified for this prototype flow.
-                          </span>
+                          <span>Identity verified for this prototype flow.</span>
                         </div>
                         <MangaButton
                           onClick={() => {
@@ -4971,9 +3351,8 @@ export default function App() {
           <MangaPanel className="prototype-note">
             <strong>Prototype note</strong>
             <span>
-              Face detection is real. Identity matching remains a prototype
-              concept; production deployment would require secure biometric
-              templates, identity matching and governance controls.
+              Face detection is real. Identity matching remains a prototype concept; production deployment would require
+              secure biometric templates, identity matching and governance controls.
             </span>
           </MangaPanel>
 
@@ -4988,9 +3367,8 @@ export default function App() {
               options={["standard", "elevated", "suspicious"]}
             />
             <span>
-              Standard demonstrates trusted access, Elevated demonstrates
-              step-up verification, and Suspicious demonstrates high-risk
-              denial with incident/alert creation.
+              Standard demonstrates trusted access, Elevated demonstrates step-up verification, and Suspicious
+              demonstrates high-risk denial with incident/alert creation.
             </span>
           </MangaPanel>
         </div>
@@ -4998,37 +3376,18 @@ export default function App() {
     );
   }
 
-  /* ─────────────────────────────────────────────
-     ROUTER
-  ───────────────────────────────────────────── */
-  if (view === "landing") return <LandingPage />;
-  if (view === "architecture") return <ArchitecturePage />;
-  if (view === "capabilities") return <CapabilitiesPage />;
-  if (view === "ethics") return <EthicsPage />;
-  if (view === "iterations") return <IterationsPage />;
-  if (view === "enroll") return <EnrollmentPage />;
-  if (view === "login") return <LoginPage />;
-  if (view === "dashboard" && session)
-    return commonShell(
-      <>
-        <StyleInjector />
-        <Atmosphere />
-        <AuthShell />
-        <AnimatePresence>
-          {toast && (
-            <motion.div
-              initial={{ opacity: 0, y: 15 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: 15 }}
-              className="toast"
-            >
-              {toast}
-            </motion.div>
-          )}
-        </AnimatePresence>
-      </>
-    );
-  if (view === "dashboard" && !session)
+  // ROUTER
+  if (view === "landing") return LandingPage();
+  if (view === "architecture") return ArchitecturePage();
+  if (view === "capabilities") return CapabilitiesPage();
+  if (view === "ethics") return EthicsPage();
+  if (view === "iterations") return IterationsPage();
+  if (view === "enroll") return EnrollmentPage();
+  if (view === "login") return LoginPage();
+
+  if (view === "dashboard" && session) return commonShell(AuthShell());
+
+  if (view === "dashboard" && !session) {
     return commonShell(
       <div className="public-page narrow">
         <MangaPanel>
@@ -5048,6 +3407,7 @@ export default function App() {
         </MangaPanel>
       </div>
     );
+  }
 
-  return <LandingPage />;
+  return LandingPage();
 }
