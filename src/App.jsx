@@ -281,6 +281,10 @@ const pageMeta = {
   incidents: { title: "Security Incidents", section: "OPERATIONS" },
   alerts: { title: "Security Alerts", section: "OPERATIONS" },
   explorer: { title: "Data Explorer", section: "OPERATIONS" },
+  accessReviews: { title: "Access Reviews", section: "GOVERNANCE" },
+  devices: { title: "Device Trust", section: "GOVERNANCE" },
+  compliance: { title: "Compliance Centre", section: "GOVERNANCE" },
+  simulator: { title: "Policy Simulator", section: "GOVERNANCE" },
   staff: { title: "Staff Directory", section: "ADMINISTRATION" },
   audit: { title: "Audit Log", section: "ADMINISTRATION" },
   health: { title: "System Health", section: "ADMINISTRATION" },
@@ -1407,6 +1411,21 @@ export default function App() {
   const [authAnomalous, setAuthAnomalous] = useState(false);
   const [authFailCount, setAuthFailCount] = useState(0);
   const [authError, setAuthError] = useState("");
+  const [portalSessionStartedAt, setPortalSessionStartedAt] = useState(Date.now());
+  const [lockdownMode, setLockdownMode] = useState(false);
+  const [trustedDevices, setTrustedDevices] = useState([
+    { id: "A12", name: "Hospital Workstation #A12", location: "Colombo · Core LAN", status: "Trusted", lastSeen: Date.now() },
+    { id: "R04", name: "Reception Terminal #R04", location: "Front Desk", status: "Review", lastSeen: Date.now() - 1000 * 60 * 42 },
+    { id: "M02", name: "Mobile Admin Device #M02", location: "External Network", status: "Blocked", lastSeen: Date.now() - 1000 * 60 * 180 },
+  ]);
+  const [accessReviewState, setAccessReviewState] = useState({});
+  const [complianceLastRun, setComplianceLastRun] = useState(null);
+  const [simulator, setSimulator] = useState({
+    enrolled: true,
+    anomalous: false,
+    failed: 0,
+    scenario: "standard",
+  });
 
   const enrollCameraRef = useRef(null);
   const authCameraRef = useRef(null);
@@ -1955,6 +1974,59 @@ export default function App() {
     showToast("Security report exported.");
   };
 
+  const updateReview = async (staffId, status) => {
+    setAccessReviewState((cur) => ({ ...cur, [staffId]: status }));
+    try {
+      const user = users.find((u) => u.staffId === staffId);
+      await addAudit(
+        "ACCESS_REVIEW",
+        `${status.toUpperCase()} access review for ${staffId}.`,
+        user || session
+      );
+      showToast(`Access review: ${status}.`);
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  const toggleDeviceTrust = async (deviceId) => {
+    const target = trustedDevices.find((d) => d.id === deviceId);
+    if (!target) return;
+    const nextStatus = target.status === "Trusted" ? "Blocked" : "Trusted";
+    setTrustedDevices((items) =>
+      items.map((d) => (d.id === deviceId ? { ...d, status: nextStatus, lastSeen: Date.now() } : d))
+    );
+    await addAudit(
+      "DEVICE_TRUST_UPDATE",
+      `${target.name} changed from ${target.status} to ${nextStatus}.`,
+      session
+    );
+    showToast(`${target.name}: ${nextStatus}.`);
+  };
+
+  const runComplianceCheck = async () => {
+    const result = {
+      ranAt: Date.now(),
+      controls: [
+        { name: "Biometric consent", status: enrollConsent || users.length > 0 ? "PASS" : "REVIEW" },
+        { name: "Role-based access", status: session?.role ? "PASS" : "REVIEW" },
+        { name: "Audit trail", status: auditLogs.length >= 1 ? "PASS" : "REVIEW" },
+        { name: "Incident response", status: incidents.length === 0 || incidents.some((i) => i.status) ? "PASS" : "REVIEW" },
+        { name: "Security monitoring", status: faceModelState === "ready" && dbState === "ready" ? "PASS" : "REVIEW" },
+      ],
+    };
+    setComplianceLastRun(result);
+    await addAudit("COMPLIANCE_CHECK", `Compliance control check completed with ${result.controls.filter((c) => c.status === "PASS").length}/${result.controls.length} controls passing.`);
+    showToast("Compliance control check completed.");
+  };
+
+  const simulatePolicy = () => {
+    const risk = calculateRisk(simulator);
+    return { ...risk, tier: riskTier(risk.score) };
+  };
+
+  const sessionDurationMinutes = Math.max(0, Math.floor((Date.now() - portalSessionStartedAt) / 60000));
+
   const goDashboard = (tab) => {
     const allowed = accessibleNavItems.some((section) =>
       section.items.some((item) => item.id === tab)
@@ -1969,7 +2041,32 @@ export default function App() {
   };
 
   const commonShell = (content) => (
-    <div className="app-shell">
+    <div className={`app-shell ${lockdownMode ? "app-lockdown" : ""}`}>
+      <style>{`
+        .toast { position: fixed !important; right: 24px !important; bottom: 24px !important; left: auto !important; top: auto !important; width: min(420px, calc(100vw - 48px)) !important; max-width: 420px !important; min-height: 0 !important; z-index: 9999 !important; padding: 14px 18px !important; border-radius: 12px !important; box-sizing: border-box !important; box-shadow: 0 18px 50px rgba(0,0,0,.45) !important; }
+        .topbar-icon { border: 1px solid rgba(255,255,255,.12); background: rgba(255,255,255,.04); color: #fff; width: 36px; height: 36px; border-radius: 10px; display: inline-flex; align-items: center; justify-content: center; cursor: pointer; }
+        .topbar-icon:hover { background: rgba(255,255,255,.09); }
+        .quick-actions { display:grid; grid-template-columns: 1.4fr 1fr; gap:16px; }
+        .quick-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; margin-top:14px; }
+        .quick-grid > div { padding:12px; border:1px solid rgba(255,255,255,.08); border-radius:10px; background:rgba(255,255,255,.025); }
+        .quick-grid span, .compliance-score span { display:block; color:#8e8e8e; font-size:11px; text-transform:uppercase; letter-spacing:.08em; }
+        .quick-grid strong { display:block; margin-top:5px; font-size:22px; }
+        .feature-banner { display:flex; justify-content:space-between; gap:16px; align-items:center; }
+        .feature-banner strong, .feature-banner span { display:block; }
+        .feature-banner span { color:#8e8e8e; margin-top:4px; }
+        .review-table, .device-grid { display:grid; gap:14px; }
+        .review-row-head { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; }
+        .device-grid { grid-template-columns:repeat(3,minmax(0,1fr)); }
+        .compliance-score { display:grid; gap:10px; }
+        .compliance-score strong { font-size:40px; display:block; margin-top:4px; }
+        .compliance-progress { margin:0 !important; }
+        .control-card { display:flex; align-items:center; justify-content:space-between; gap:16px; }
+        .control-card strong, .control-card small { display:block; }
+        .control-card small { color:#898989; margin-top:5px; max-width:720px; }
+        .simulator-result { display:grid; gap:18px; }
+        .app-lockdown:before { content:"EMERGENCY LOCKDOWN · DEMONSTRATION MODE"; position:fixed; left:0; right:0; top:0; z-index:9998; text-align:center; padding:7px 12px; background:#f87171; color:#090909; font-size:11px; font-weight:800; letter-spacing:.08em; }
+        @media (max-width: 900px) { .quick-actions, .device-grid { grid-template-columns:1fr; } .quick-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } .topbar-right { gap:7px !important; } }
+      `}</style>
       <Atmosphere />
       {content}
       <AnimatePresence>
@@ -2133,11 +2230,19 @@ export default function App() {
               </div>
             </div>
             <div className="topbar-right">
+              {lockdownMode && <StatusPill tone="bad">LOCKDOWN ACTIVE</StatusPill>}
+              <button className="topbar-icon" title="Open alerts" onClick={() => goDashboard("alerts")}><Bell size={17} /></button>
               <span className={`status-pill status-${postureTone}`}>POSTURE {analytics.posture}/100</span>
               <LiveClock />
             </div>
           </header>
 
+          {lockdownMode && (
+            <div className="error-banner" style={{ margin: "0 24px" }}>
+              <AlertTriangle size={16} />
+              Emergency lockdown is active for demonstration. Authentication events remain viewable, but the system is marked restricted.
+            </div>
+          )}
           <div className="dashboard-content">{renderDashboardTab()}</div>
         </main>
       </div>
@@ -2162,6 +2267,14 @@ export default function App() {
         return SecurityAlerts();
       case "explorer":
         return DataExplorer();
+      case "accessReviews":
+        return AccessReviews();
+      case "devices":
+        return DeviceTrust();
+      case "compliance":
+        return ComplianceCentre();
+      case "simulator":
+        return PolicySimulator();
       case "staff":
         return StaffDirectory();
       case "audit":
@@ -2200,6 +2313,26 @@ export default function App() {
           <StatCard label="Success Rate" value={`${analytics.successRate}%`} icon={ShieldCheck} />
           <StatCard label="Average Risk" value={`${analytics.avgRisk}/100`} icon={TrendingUp} />
           <StatCard label="Open Incidents" value={analytics.openIncidents} icon={AlertOctagon} />
+        </div>
+
+        <div className="quick-actions">
+          <MangaPanel>
+            <div className="eyebrow">ZERO-TRUST SNAPSHOT</div>
+            <div className="quick-grid">
+              <div><span>Trusted Devices</span><strong>{trustedDevices.filter((d) => d.status === "Trusted").length}</strong></div>
+              <div><span>Flagged Reviews</span><strong>{Object.values(accessReviewState).filter((x) => x === "Flagged").length}</strong></div>
+              <div><span>Unread Alerts</span><strong>{analytics.unreadAlerts}</strong></div>
+              <div><span>Session</span><strong>{sessionDurationMinutes}m</strong></div>
+            </div>
+          </MangaPanel>
+          <MangaPanel>
+            <div className="eyebrow">QUICK ACTIONS</div>
+            <div className="button-row">
+              <MangaButton icon={Download} onClick={exportSecurityReport}>Export Report</MangaButton>
+              <MangaButton variant="ghost" onClick={() => goDashboard("simulator")}>Policy Simulator</MangaButton>
+              {session?.role === "Administrator" && <MangaButton variant="secondary" onClick={() => goDashboard("compliance")}>Run Compliance</MangaButton>}
+            </div>
+          </MangaPanel>
         </div>
 
         <div className="two-col">
@@ -2598,6 +2731,193 @@ export default function App() {
     );
   }
 
+  function AccessReviews() {
+    const rows = users.map((u) => {
+      const mine = authEvents.filter((e) => e.staffId === u.staffId);
+      const last = mine[0];
+      const risk = last ? last.riskScore : 0;
+      const current = accessReviewState[u.staffId] || (risk >= 60 ? "Flagged" : "Pending");
+      return { ...u, attempts: mine.length, risk, last: last?.timestamp, current };
+    });
+
+    return (
+      <div className="page-stack">
+        <SectionHeader
+          eyebrow="GOVERNANCE"
+          title="Access Reviews"
+          description="Administrator review queue for staff access, risk and least-privilege decisions."
+        />
+        <MangaPanel>
+          <div className="feature-banner">
+            <div>
+              <strong>Quarterly access governance</strong>
+              <span>Review high-risk identities, confirm role alignment and document the decision.</span>
+            </div>
+            <StatusPill tone={rows.some((r) => r.current === "Flagged") ? "bad" : "good"}>
+              {rows.filter((r) => r.current === "Flagged").length} FLAGGED
+            </StatusPill>
+          </div>
+        </MangaPanel>
+
+        {!rows.length ? <EmptyState text="No enrolled staff require review." /> : (
+          <div className="review-table">
+            {rows.map((r) => (
+              <MangaPanel key={r.staffId}>
+                <div className="review-row-head">
+                  <div>
+                    <div className="eyebrow">{r.staffId}</div>
+                    <h3>{r.name}</h3>
+                    <small>{r.role} · {r.department}</small>
+                  </div>
+                  <StatusPill tone={r.current === "Flagged" ? "bad" : r.current === "Approved" ? "good" : "warn"}>
+                    {r.current}
+                  </StatusPill>
+                </div>
+                <div className="detail-grid">
+                  <div><span>Attempts</span><strong>{r.attempts}</strong></div>
+                  <div><span>Latest Risk</span><strong>{r.risk}/100</strong></div>
+                  <div><span>Last Access</span><strong>{r.last ? formatDate(r.last) : "—"}</strong></div>
+                  <div><span>Access Level</span><strong>{r.role === "Administrator" ? "Elevated" : "Standard"}</strong></div>
+                </div>
+                <div className="button-row">
+                  <MangaButton variant="ghost" onClick={() => updateReview(r.staffId, "Approved")}>Approve</MangaButton>
+                  <MangaButton variant="secondary" onClick={() => updateReview(r.staffId, "Flagged")}>Flag for Review</MangaButton>
+                </div>
+              </MangaPanel>
+            ))}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  function DeviceTrust() {
+    return (
+      <div className="page-stack">
+        <SectionHeader
+          eyebrow="ZERO-TRUST OPERATIONS"
+          title="Device Trust"
+          description="Monitor hospital endpoints used for authentication and rapidly quarantine suspicious devices."
+        />
+        <div className="stats-grid">
+          <StatCard label="Trusted Devices" value={trustedDevices.filter((d) => d.status === "Trusted").length} icon={ShieldCheck} />
+          <StatCard label="Under Review" value={trustedDevices.filter((d) => d.status === "Review").length} icon={ShieldAlert} />
+          <StatCard label="Blocked" value={trustedDevices.filter((d) => d.status === "Blocked").length} icon={ShieldX} />
+          <StatCard label="Monitored" value={trustedDevices.length} icon={Activity} />
+        </div>
+        <div className="device-grid">
+          {trustedDevices.map((device) => (
+            <MangaPanel key={device.id}>
+              <div className="incident-top">
+                <div>
+                  <div className="eyebrow">DEVICE {device.id}</div>
+                  <h3>{device.name}</h3>
+                  <small>{device.location}</small>
+                </div>
+                <StatusPill tone={device.status === "Trusted" ? "good" : device.status === "Blocked" ? "bad" : "warn"}>
+                  {device.status}
+                </StatusPill>
+              </div>
+              <div className="detail-grid">
+                <div><span>Last Seen</span><strong>{formatDate(device.lastSeen)}</strong></div>
+                <div><span>Trust Rule</span><strong>{device.status === "Trusted" ? "Allow" : "Step-up"}</strong></div>
+              </div>
+              <MangaButton variant={device.status === "Trusted" ? "secondary" : "primary"} onClick={() => toggleDeviceTrust(device.id)}>
+                {device.status === "Trusted" ? "Revoke Trust" : "Trust Device"}
+              </MangaButton>
+            </MangaPanel>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  function ComplianceCentre() {
+    const controls = complianceLastRun?.controls || [
+      { name: "Biometric consent", status: "NOT RUN" },
+      { name: "Role-based access", status: "NOT RUN" },
+      { name: "Audit trail", status: "NOT RUN" },
+      { name: "Incident response", status: "NOT RUN" },
+      { name: "Security monitoring", status: "NOT RUN" },
+    ];
+    const passCount = controls.filter((c) => c.status === "PASS").length;
+    return (
+      <div className="page-stack">
+        <SectionHeader
+          eyebrow="ASSURANCE & GOVERNANCE"
+          title="Compliance Centre"
+          description="Evidence-oriented controls demonstrating privacy, access governance and operational accountability."
+          action={<MangaButton icon={RefreshCw} onClick={runComplianceCheck}>Run Control Check</MangaButton>}
+        />
+        <MangaPanel>
+          <div className="compliance-score">
+            <div>
+              <span>CONTROL SCORE</span>
+              <strong>{passCount}/{controls.length}</strong>
+            </div>
+            <div className="progress-track compliance-progress"><div className="progress-value" style={{width: `${(passCount / Math.max(1, controls.length)) * 100}%`}} /></div>
+            <small>{complianceLastRun ? `Last run ${formatDate(complianceLastRun.ranAt)}` : "Run the control check to generate evidence."}</small>
+          </div>
+        </MangaPanel>
+        <div className="stack-list">
+          {controls.map((c) => (
+            <MangaPanel key={c.name} className="control-card">
+              <div>
+                <strong>{c.name}</strong>
+                <small>
+                  {c.name === "Biometric consent" && "Consent and privacy governance before biometric capture."}
+                  {c.name === "Role-based access" && "Role-sensitive access to clinical and security features."}
+                  {c.name === "Audit trail" && "Administrative and authentication actions are traceable."}
+                  {c.name === "Incident response" && "High-risk events can create and track security incidents."}
+                  {c.name === "Security monitoring" && "Core security data and face-detection services are operational."}
+                </small>
+              </div>
+              <StatusPill tone={c.status === "PASS" ? "good" : c.status === "REVIEW" ? "warn" : "neutral"}>{c.status}</StatusPill>
+            </MangaPanel>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  function PolicySimulator() {
+    const result = simulatePolicy();
+    return (
+      <div className="page-stack">
+        <SectionHeader
+          eyebrow="SECURITY ENGINEERING"
+          title="Policy Simulator"
+          description="Test how contextual signals change an authentication decision without touching real access records."
+        />
+        <MangaPanel>
+          <div className="filter-grid">
+            <MangaSelect label="Scenario" value={simulator.scenario} onChange={(e) => setSimulator((s) => ({ ...s, scenario: e.target.value, anomalous: e.target.value === "suspicious" }))} options={["standard", "elevated", "suspicious"]} />
+            <MangaSelect label="Failed Attempts" value={String(simulator.failed)} onChange={(e) => setSimulator((s) => ({ ...s, failed: Number(e.target.value) }))} options={["0", "1", "2", "3", "5"]} />
+            <MangaSelect label="Enrolled Identity" value={simulator.enrolled ? "yes" : "no"} onChange={(e) => setSimulator((s) => ({ ...s, enrolled: e.target.value === "yes" }))} options={["yes", "no"]} />
+            <MangaSelect label="Network / Device Pattern" value={simulator.anomalous ? "anomalous" : "normal"} onChange={(e) => setSimulator((s) => ({ ...s, anomalous: e.target.value === "anomalous" }))} options={["normal", "anomalous"]} />
+          </div>
+        </MangaPanel>
+        <MangaPanel className="simulator-result">
+          <div className="hero-score">
+            <span>SIMULATED RISK SCORE</span>
+            <strong>{result.score}</strong><small>/ 100</small>
+          </div>
+          <StatusPill tone={result.tier.tone}>{result.tier.label}</StatusPill>
+          <div className="risk-factors">
+            {result.factors.map((f) => (
+              <div key={f.label} className="risk-factor">
+                <div><span>{f.label}</span><strong>+{f.value}</strong></div>
+                <ProgressBar value={Math.min(100, f.value * 2.5)} />
+                <small>{f.desc}</small>
+              </div>
+            ))}
+          </div>
+          <MangaButton variant="ghost" onClick={() => showToast("Policy simulation completed — no live access was changed.")}>Record Demonstration</MangaButton>
+        </MangaPanel>
+      </div>
+    );
+  }
+
   function StaffDirectory() {
     return (
       <div className="page-stack">
@@ -2742,6 +3062,20 @@ export default function App() {
                   Never share credentials or bypass biometric controls in a production environment.
                 </small>
               </div>
+            </div>
+            <div className="setting-row">
+              <div>
+                <strong>Emergency Lockdown</strong>
+                <small>Prototype control that visually marks the portal as locked down for demonstration purposes.</small>
+              </div>
+              <MangaButton variant={lockdownMode ? "primary" : "ghost"} onClick={async () => {
+                const next = !lockdownMode;
+                setLockdownMode(next);
+                await addAudit("EMERGENCY_LOCKDOWN", `Prototype lockdown ${next ? "enabled" : "disabled"}.`);
+                showToast(next ? "Emergency lockdown enabled." : "Emergency lockdown disabled.");
+              }}>
+                {lockdownMode ? "Disable" : "Enable"}
+              </MangaButton>
             </div>
           </div>
         </MangaPanel>
@@ -3324,6 +3658,7 @@ export default function App() {
                         <MangaButton
                           onClick={() => {
                             setSession(selectedAuthUser);
+                            setPortalSessionStartedAt(Date.now());
                             navigate("dashboard");
                           }}
                         >
