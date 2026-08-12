@@ -699,9 +699,12 @@ const BiometricCamera = forwardRef(function BiometricCamera(
   );
 
   const start = useCallback(async () => {
-    const token = ++startTokenRef.current;
-
+    // Stop any previous stream first, then create a fresh token.
+    // IMPORTANT: stop() increments startTokenRef, so creating the token
+    // before stop() invalidates the new start request immediately.
     stop();
+
+    const token = ++startTokenRef.current;
     emitState(CameraStates.LOADING_MODEL);
     setErrorMessage("");
 
